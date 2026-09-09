@@ -267,6 +267,17 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
     mp_output_chain_set_vo(vo_c->filter, vo_c->vo);
     vo_c->filter->update_subtitles = filter_update_subtitles;
     vo_c->filter->update_subtitles_ctx = mpctx;
+    int video_ordinal = -1;
+    if (track && track->demuxer && track->stream) {
+        int index = 0;
+        for (int n = 0; n < demux_get_num_stream(track->demuxer); n++) {
+            struct sh_stream *stream = demux_get_stream(track->demuxer, n);
+            if (stream->type != STREAM_VIDEO) continue;
+            if (stream == track->stream) { video_ordinal = index; break; }
+            index++;
+        }
+        mp_output_chain_set_source(vo_c->filter, track->demuxer->filename, video_ordinal);
+    }
 
     if (track) {
         vo_c->track = track;
@@ -1142,11 +1153,17 @@ void write_video(struct MPContext *mpctx)
         mpctx->video_status = STATUS_SYNCING;
 
     if (r == VD_WAIT) {
-        if (async->adaptive && mpctx->video_status == STATUS_PLAYING &&
+        if ((async->adaptive || async->live) && mpctx->video_status == STATUS_PLAYING &&
             !mpctx->paused_for_enhancement) {
             if (vo_still_displaying(vo)) {
                 vo_request_wakeup_on_done(vo);
             } else {
+                if (async->live) {
+                    struct mp_filter_command command = { .type = MP_FILTER_COMMAND_TEXT,
+                        .cmd = "policy", .arg = "adaptive" };
+                    mp_output_chain_command(vo_c->filter, "all", &command);
+                    MP_WARN(mpctx, "Live missed a video deadline; using Adaptive shared-clock buffering\n");
+                }
                 mpctx->paused_for_enhancement = true;
                 mpctx->enhancement_buffer_start = mp_time_sec();
                 mpctx->enhancement_buffer_count++;

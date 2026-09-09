@@ -17,6 +17,7 @@ int main(void)
     original->source_duration = 1001;
     original->source_timebase_num = 1;
     original->source_timebase_den = 30000;
+    original->async_content_kind = 1;
     struct mp_image *retained = mp_image_new_ref(original);
     struct mp_image *copied = mp_image_new_copy(original);
     assert_true(mp_image_is_current(retained));
@@ -30,13 +31,16 @@ int main(void)
     copied->source_pts++;
     original->planes[0][0] = 17;
     copied->planes[0][0] = 93;
+    copied->async_content_kind = 2;
     assert_true(mp_image_set_async_pair(copied, original));
     struct mp_image *source_variant = mp_image_async_variant(copied, true);
     assert_true(source_variant->planes[0][0] == 17);
     assert_true(source_variant->async_original);
+    assert_true(source_variant->async_content_kind == 1);
     struct mp_image *enhanced_variant = mp_image_async_variant(source_variant, false);
     assert_true(enhanced_variant->planes[0][0] == 93);
     assert_false(enhanced_variant->async_original);
+    assert_true(enhanced_variant->async_content_kind == 2);
     assert_true(mp_image_same_async_identity(source_variant, enhanced_variant));
     talloc_free(original);
     // Source destruction cannot invalidate a retained descriptor. A seek updates

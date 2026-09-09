@@ -54,6 +54,8 @@ struct mp_output_chain *mp_output_chain_create(struct mp_filter *parent,
 // For type==MP_OUTPUT_CHAIN_VIDEO only.
 struct vo;
 void mp_output_chain_set_vo(struct mp_output_chain *p, struct vo *vo);
+void mp_output_chain_set_source(struct mp_output_chain *p, const char *path,
+                                 int video_ordinal);
 
 // Set the AO. The AO format will be used to determine the filter chain output.
 // The API user may be asked to update the AO midstream if ao_needs_update is

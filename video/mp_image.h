@@ -113,6 +113,9 @@ typedef struct mp_image {
     uint64_t async_frame_generation;
     struct AVBufferRef *async_pair; // immutable retained original/enhanced pair
     bool async_original, async_preview;
+    // Per-output content provenance: 0 unknown, 1 original, 2 enhanced,
+    // 3 prepared original, 4 prepared enhanced. Independent of pair selection.
+    int async_content_kind;
     /* container reported FPS; can be incorrect, or 0 if unknown */
     double nominal_fps;
     /* for private use */

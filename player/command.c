@@ -77,6 +77,7 @@
 #include "misc/dispatch.h"
 #include "misc/language.h"
 #include "misc/node.h"
+#include "misc/json.h"
 #include "misc/thread_pool.h"
 #include "misc/thread_tools.h"
 
@@ -1712,7 +1713,8 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         &mpctx->vo_chain->filter->async_video : &empty;
     struct mpv_node *r = arg;
     node_init(r, MPV_FORMAT_NODE_MAP, NULL);
-    node_map_add_string(r, "policy", !s->active ? "bypass" :
+    node_map_add_flag(r, "prepared-supported", HAVE_FRAME_ENGINE);
+    node_map_add_string(r, "policy", !s->active ? "bypass" : s->prepared_json ? "prepared" :
                         s->live ? "live" : s->adaptive ? "adaptive" : "direct");
     node_map_add_flag(r, "buffering", mpctx->paused_for_enhancement);
     node_map_add_flag(r, "preview-pending", s->waiting_preview);
@@ -1730,6 +1732,14 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     node_map_add_double(r, "colour-strength", s->colour_strength);
     node_map_add_string(r, "model", s->model ? s->model : "original");
     node_map_add_string(r, "hardware", s->hardware ? s->hardware : "unavailable");
+    if (s->prepared_json) {
+        // json_parse unescapes strings in place; preserve the cached snapshot
+        // for subsequent property readers.
+        char *json = talloc_strdup(r->u.list, s->prepared_json);
+        struct mpv_node *prepared = node_map_add(r, "prepared", MPV_FORMAT_NONE);
+        if (json_parse(r->u.list, prepared, &json, MAX_JSON_DEPTH) < 0)
+            node_init(prepared, MPV_FORMAT_NONE, NULL);
+    }
     node_map_add_double(r, "completed-p95-seconds", s->completed_p95);
     node_map_add_double(r, "source-fps", s->source_fps);
     node_map_add_int64(r, "buffer-count", mpctx->enhancement_buffer_count);
@@ -1742,6 +1752,9 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
                       mp_image_is_current(current) && mpctx->opts->pause);
     node_map_add_string(r, "comparison", current && current->async_original ? "original" : "enhanced");
     if (current && current->async_generation) {
+        const char *kinds[] = {"unknown", "original", "enhanced", "prepared-original", "prepared-enhanced"};
+        int kind = current->async_content_kind;
+        node_map_add_string(r, "displayed-content-kind", kind >= 0 && kind < MP_ARRAY_SIZE(kinds) ? kinds[kind] : "unknown");
         node_map_add_int64(r, "displayed-source-pts", current->source_pts);
         node_map_add_int64(r, "displayed-timebase-num", current->source_timebase_num);
         node_map_add_int64(r, "displayed-timebase-den", current->source_timebase_den);

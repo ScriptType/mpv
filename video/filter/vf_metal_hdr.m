@@ -32,6 +32,8 @@ struct hdr_options {
     char *model;
     char *measurements;
     char *measurement_config, *engine_report;
+    char *prepared_config;
+    bool prepare;
     int processing_width, processing_height;
     double strength, colour_strength, reference_white, hlg_peak, maximum_luminance_ratio;
     bool bypass;
@@ -43,6 +45,7 @@ struct hdr_result {
     fe_frame frame;
     double normalized_host, normalization_gpu_seconds;
     float peak_nits;
+    fe_content_kind content_kind;
 };
 
 struct hdr_pending {
@@ -59,11 +62,13 @@ struct hdr_gpu_job {
     CVMetalTextureRef input_view, output_view;
     id<MTLCommandBuffer> command;
     id<MTLBuffer> peak;
+    fe_content_kind content_kind;
 };
 
 struct priv {
     struct hdr_options *opts;
     fe_session *session;
+    fe_prepared *prepared;
     mp_thread thread;
     mp_mutex lock;
     mp_cond wakeup;
@@ -93,6 +98,24 @@ struct priv {
     double completed_times[60];
     uint64_t completed_samples;
 };
+
+static void refresh_prepared(struct priv *p)
+{
+    if (!p->prepared || !p->state)
+        return;
+    size_t size = fe_prepared_progress_json(p->prepared, NULL, 0);
+    if (!size || size > 1024 * 1024) return;
+    char *json = talloc_size(p, size);
+    if (fe_prepared_progress_json(p->prepared, json, size) > size) {
+        talloc_free(json); return;
+    }
+    if (p->state->prepared_json && !strcmp(json, p->state->prepared_json)) {
+        talloc_free(json); return;
+    }
+    talloc_free((void *)p->state->prepared_json);
+    p->state->prepared_json = json;
+    p->state->revision++;
+}
 
 static void update_state(struct priv *p)
 {
@@ -133,7 +156,7 @@ static void qualify_live(struct mp_filter *f, double seconds)
     memcpy(sorted, p->completed_times, n * sizeof(double));
     qsort(sorted, n, sizeof(double), compare_double);
     p->state->completed_p95 = sorted[(int)ceil(n * .95) - 1];
-    bool qualified = count >= 60 && p->opts->model && p->opts->model[0] &&
+    bool qualified = !p->prepared && count >= 60 && p->opts->model && p->opts->model[0] &&
         p->opts->strength > 0 && p->opts->processing_width >= 320 &&
         p->opts->processing_height >= 192 && p->state->source_fps > 0 &&
         p->state->completed_p95 <= .8 / p->state->source_fps;
@@ -258,8 +281,13 @@ static MP_THREAD_VOID poll_worker(void *argument)
             bool retry = p->retry_admission;
             bool idle = !retry && !job.lease && p->active_work <= p->result_count;
             if (!stop && idle) {
-                mp_cond_wait(&p->wakeup, &p->lock);
+                bool preparing = p->prepared && !fe_prepared_is_idle(p->prepared);
+                if (preparing)
+                    mp_cond_timedwait(&p->wakeup, &p->lock, MP_TIME_MS_TO_NS(100));
+                else
+                    mp_cond_wait(&p->wakeup, &p->lock);
                 mp_mutex_unlock(&p->lock);
+                if (preparing) mp_filter_wakeup(f);
                 continue;
             }
             mp_mutex_unlock(&p->lock);
@@ -281,6 +309,7 @@ static MP_THREAD_VOID poll_worker(void *argument)
                 if (fe_session_poll(p->session, &output) == FE_ACCEPTED) {
                     job.lease = output;
                     job.frame = *fe_output_frame(output);
+                    job.content_kind = fe_output_content_kind(output);
                 }
             }
             if (job.lease && !job.command) {
@@ -303,6 +332,7 @@ static MP_THREAD_VOID poll_worker(void *argument)
                         .buffer = job.buffer, .frame = job.frame,
                         .normalized_host = CACurrentMediaTime(),
                         .normalization_gpu_seconds = job.command.GPUEndTime - job.command.GPUStartTime,
+                        .content_kind = job.content_kind,
                     };
                     memcpy(&result.peak_nits, job.peak.contents, sizeof(float));
                     fe_session_record_transfers(p->session, job.frame.generation, job.frame.frame_id, 1, 1, 0);
@@ -521,6 +551,7 @@ static bool configure_measurements(struct mp_filter *f, struct mp_image *image)
 static void process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
+    refresh_prepared(p);
     bool needs_output = mp_pin_in_needs_data(f->ppins[1]);
     mp_mutex_lock(&p->lock);
     if (p->failed) {
@@ -575,6 +606,7 @@ static void process(struct mp_filter *f)
             av_buffer_unref(&image->async_generation);
             image->async_generation = av_buffer_ref(p->generation);
             image->async_frame_generation = output.frame.generation;
+            image->async_content_kind = output.content_kind;
             if (!mp_image_set_async_pair(image, pending.image)) {
                 talloc_free(image);
                 talloc_free(pending.image);
@@ -589,6 +621,7 @@ static void process(struct mp_filter *f)
             mp_mutex_unlock(&p->lock);
             qualify_live(f, output.normalized_host - pending.submitted_host);
             update_state(p);
+            refresh_prepared(p);
             if (p->measurements) {
                 fprintf(p->measurements, "{\"event\":\"filter-output\",\"frame\":%llu,\"generation\":%llu,"
                     "\"pts_value\":%lld,\"pts_timescale\":%d,\"submitted_host\":%.9f,\"completed_host\":%.9f,"
@@ -675,6 +708,7 @@ static void process(struct mp_filter *f)
     av_buffer_unref(&image->async_generation);
     image->async_generation = av_buffer_ref(p->generation);
     image->async_frame_generation = frame.generation;
+    image->async_content_kind = FE_CONTENT_ORIGINAL;
     if (p->need_preview && p->state && !p->preview_emitted) {
         struct mp_image *preview = mp_image_new_ref(image);
         preview->async_original = true;
@@ -717,6 +751,20 @@ static bool command(struct mp_filter *f, struct mp_filter_command *command)
     struct priv *p = f->priv;
     if (command->type != MP_FILTER_COMMAND_TEXT)
         return false;
+    if (!strcmp(command->cmd, "prepare")) {
+        if (!p->prepared) return false;
+        if (!strcmp(command->arg, "start")) {
+            if (fe_prepared_start(p->prepared) != FE_ACCEPTED) return false;
+        } else if (!strcmp(command->arg, "cancel")) {
+            fe_prepared_cancel(p->prepared);
+        } else return false;
+        refresh_prepared(p);
+        mp_mutex_lock(&p->lock);
+        mp_cond_signal(&p->wakeup);
+        mp_mutex_unlock(&p->lock);
+        mp_filter_wakeup(f);
+        return true;
+    }
     if (!strcmp(command->cmd, "compare")) {
         struct mp_stream_info *info = mp_filter_find_stream_info(f);
         if (!info || !info->dr_vo || !p->state || !p->state->user_paused)
@@ -764,6 +812,7 @@ static void destroy(struct mp_filter *f)
     struct priv *p = f->priv;
     if (p->generation)
         atomic_fetch_add((_Atomic uint64_t *)p->generation->data, 1);
+    if (p->prepared) fe_prepared_cancel(p->prepared);
     if (p->state && p->state->owner == p) {
         mp_image_unrefp(&p->state->replacement);
         *p->state = (struct mp_async_video_state){ .revision = p->state->revision + 1 };
@@ -800,6 +849,11 @@ static void destroy(struct mp_filter *f)
         }
         fe_session_destroy(p->session);
     }
+    if (p->prepared) {
+        while (!fe_prepared_is_idle(p->prepared))
+            mp_sleep_ns(MP_TIME_MS_TO_NS(2));
+        fe_prepared_destroy(p->prepared);
+    }
     mp_frame_unref(&p->held_input);
     for (int n = 0; n < p->pending_count; n++) talloc_free(p->pending[n].image);
     for (int n = 0; n < p->result_count; n++) release_result(&p->results[n]);
@@ -829,6 +883,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         p->state->waiting_preview = false;
         p->state->live = p->state->live_qualified = false;
         p->state->warmed_samples = 0;
+        p->state->prepared_json = NULL;
         p->state->owner = p;
     }
     p->need_preview = true;
@@ -842,7 +897,30 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         .colour_strength = p->opts->colour_strength, .maximum_luminance_ratio = p->opts->maximum_luminance_ratio,
         .model_path = p->opts->model && p->opts->model[0] ? p->opts->model : NULL,
         .model_version = "mpv-metal-hdr-v1" };
-    p->session = fe_session_create(&config, p->error, sizeof(p->error));
+    if (p->opts->prepared_config && p->opts->prepared_config[0]) {
+        if (!info || !info->source_path || info->video_ordinal != 0) {
+            MP_ERR(f, "Prepared requires the opened local source and its first video stream\n");
+            goto error;
+        }
+        NSString *path = [NSString stringWithUTF8String:info->source_path];
+        if ([path containsString:@"://"]) {
+            NSURL *url = [NSURL URLWithString:path];
+            if (!url.isFileURL) {
+                MP_ERR(f, "Prepared supports local files only\n"); goto error;
+            }
+            path = url.path;
+        }
+        NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:p->opts->prepared_config]];
+        if (!data || data.length > 65536) { MP_ERR(f, "Cannot read bounded Prepared configuration\n"); goto error; }
+        NSString *json = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
+        p->prepared = fe_prepared_create(&config, json.UTF8String, path.UTF8String,
+                                         p->error, sizeof(p->error));
+        if (!p->prepared) { MP_ERR(f, "%s\n", p->error); goto error; }
+        p->session = fe_prepared_session_create(p->prepared, p->error, sizeof(p->error));
+        if (p->opts->prepare) fe_prepared_start(p->prepared);
+    } else {
+        p->session = fe_session_create(&config, p->error, sizeof(p->error));
+    }
     if (!p->session) { MP_ERR(f, "%s\n", p->error); goto error; }
     p->generation = av_buffer_allocz(sizeof(_Atomic uint64_t));
     if (!p->generation) goto error;
@@ -871,6 +949,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     if (mp_thread_create(&p->thread, poll_worker, f)) goto error;
     p->thread_started = true;
     update_state(p);
+    refresh_prepared(p);
     MP_INFO(f, "Persistent HDR engine active (%s); three slots; RGBA16F/BT.2020 output, one GPU unit-normalization pass\n",
             config.model_path ? "neural model" : "HDR original");
     return f;
@@ -883,6 +962,7 @@ error:
 static const m_option_t options[] = {
     {"model", OPT_STRING(model)}, {"measurements", OPT_STRING(measurements)},
     {"measurement-config", OPT_STRING(measurement_config)}, {"engine-report", OPT_STRING(engine_report)},
+    {"prepared-config", OPT_STRING(prepared_config)}, {"prepare", OPT_BOOL(prepare)},
     {"processing-width", OPT_INT(processing_width), M_RANGE(16, 8192)},
     {"processing-height", OPT_INT(processing_height), M_RANGE(16, 8192)},
     {"strength", OPT_DOUBLE(strength), M_RANGE(0, 1)},

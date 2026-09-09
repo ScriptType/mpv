@@ -402,6 +402,15 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
     update_output_caps(p);
 }
 
+void mp_output_chain_set_source(struct mp_output_chain *c, const char *path,
+                                 int video_ordinal)
+{
+    struct chain *p = c->f->priv;
+    talloc_free((void *)p->stream_info.source_path);
+    p->stream_info.source_path = path ? talloc_strdup(p, path) : NULL;
+    p->stream_info.video_ordinal = video_ordinal;
+}
+
 void mp_output_chain_set_el_stream(struct mp_output_chain *c,
                                    struct sh_stream *el_sh)
 {
@@ -702,6 +711,7 @@ static void create_video_things(struct chain *p)
     p->stream_info.get_display_fps = get_display_fps;
     p->stream_info.get_display_res = get_display_res;
     p->stream_info.async_video = &p->public.async_video;
+    p->stream_info.video_ordinal = -1;
 
     p->f->stream_info = &p->stream_info;
 

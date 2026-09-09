@@ -410,6 +410,7 @@ struct mp_async_video_state {
     double strength, colour_strength;
     int source_width, source_height;
     const char *model, *hardware;
+    const char *prepared_json;
     struct mp_image *replacement; // one owned, supersedable same-PTS update
 };
 
@@ -426,6 +427,8 @@ struct mp_stream_info {
     bool force_swdec;
     struct vo *dr_vo; // for calling vo_get_image()
     struct mp_async_video_state *async_video;
+    const char *source_path; // supplied by the opened playback core, not options
+    int video_ordinal; // index among this demuxer's video streams; -1 if unknown
 };
 
 // Search for a parent filter (including f) that has this set, and return it.

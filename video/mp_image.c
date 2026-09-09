@@ -625,6 +625,7 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     assign_bufref(&dst->async_pair, src->async_pair);
     dst->async_original = src->async_original;
     dst->async_preview = src->async_preview;
+    dst->async_content_kind = src->async_content_kind;
     dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;
