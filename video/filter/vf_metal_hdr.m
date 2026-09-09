@@ -23,6 +23,7 @@
 #include "options/m_option.h"
 #include "osdep/threads.h"
 #include "video/mp_image.h"
+#include "video/out/vo.h"
 
 #define HDR_SLOTS 3
 #define HDR_POOL_BUFFERS 6
@@ -34,6 +35,7 @@ struct hdr_options {
     int processing_width, processing_height;
     double strength, colour_strength, reference_white, hlg_peak, maximum_luminance_ratio;
     bool bypass;
+    int policy; // 0 direct, 1 Adaptive; Live requires runtime qualification
 };
 
 struct hdr_result {
@@ -47,6 +49,7 @@ struct hdr_pending {
     uint64_t frame_id;
     struct mp_image *image;
     double submitted_host;
+    bool preview;
 };
 
 struct hdr_gpu_job {
@@ -85,7 +88,63 @@ struct priv {
     int pool_width, pool_height;
     FILE *measurements;
     bool measurements_configured;
+    struct mp_async_video_state *state;
+    bool need_preview, preview_emitted, retry_admission;
+    double completed_times[60];
+    uint64_t completed_samples;
 };
+
+static void update_state(struct priv *p)
+{
+    if (!p->state || p->state->owner != p)
+        return;
+    p->state->active = !p->opts->bypass;
+    p->state->adaptive = p->opts->policy == 1 && !p->opts->bypass;
+    p->state->pending = p->pending_count + (p->preview_emitted ? 1 : 0);
+    p->state->generation = fe_session_generation(p->session);
+    p->state->processing_width = p->opts->processing_width;
+    p->state->processing_height = p->opts->processing_height;
+    p->state->strength = p->opts->strength;
+    p->state->colour_strength = p->opts->colour_strength;
+    p->state->submitted_frames = p->next_frame;
+    p->state->completed_frames = p->emitted;
+    p->state->model = p->opts->model;
+    p->state->revision++;
+}
+
+static int compare_double(const void *a, const void *b)
+{
+    double x = *(const double *)a, y = *(const double *)b;
+    return (x > y) - (x < y);
+}
+
+static void qualify_live(struct mp_filter *f, double seconds)
+{
+    struct priv *p = f->priv;
+    if (!p->state) return;
+    // Measure this immutable model/settings/hardware session. Exclude three cold
+    // completions, then require a full 60-frame window with 20% deadline margin.
+    if (++p->completed_samples <= 3) return;
+    uint64_t count = p->completed_samples - 3;
+    p->completed_times[(count - 1) % 60] = seconds;
+    p->state->warmed_samples = count;
+    double sorted[60];
+    int n = MPMIN(count, 60);
+    memcpy(sorted, p->completed_times, n * sizeof(double));
+    qsort(sorted, n, sizeof(double), compare_double);
+    p->state->completed_p95 = sorted[(int)ceil(n * .95) - 1];
+    bool qualified = count >= 60 && p->opts->model && p->opts->model[0] &&
+        p->opts->strength > 0 && p->opts->processing_width >= 320 &&
+        p->opts->processing_height >= 192 && p->state->source_fps > 0 &&
+        p->state->completed_p95 <= .8 / p->state->source_fps;
+    p->state->live_qualified = qualified;
+    if (p->state->live && !qualified) {
+        p->state->live = false;
+        p->opts->policy = 1;
+        MP_WARN(f, "Live deadline qualification lost; switching to Adaptive shared-clock buffering\n");
+    }
+    update_state(p);
+}
 
 static void release_result(struct hdr_result *result)
 {
@@ -196,13 +255,16 @@ static MP_THREAD_VOID poll_worker(void *argument)
             mp_mutex_lock(&p->lock);
             bool stop = p->stop;
             bool room = p->result_count < HDR_SLOTS;
-            bool idle = !job.lease && p->active_work <= p->result_count;
+            bool retry = p->retry_admission;
+            bool idle = !retry && !job.lease && p->active_work <= p->result_count;
             if (!stop && idle) {
                 mp_cond_wait(&p->wakeup, &p->lock);
                 mp_mutex_unlock(&p->lock);
                 continue;
             }
             mp_mutex_unlock(&p->lock);
+            if (retry)
+                mp_filter_wakeup(f);
             if (stop) {
                 if (job.command && job.command.status < MTLCommandBufferStatusCompleted) {
                     // The libmpv core shuts down off AppKit's main thread. Drain
@@ -280,14 +342,27 @@ static void reset(struct mp_filter *f)
     p->pending_count = 0;
     p->eof = false;
     p->have_input_params = false;
+    p->need_preview = true;
+    p->preview_emitted = false;
+    p->completed_samples = 0;
+    if (p->state && p->state->owner == p) {
+        mp_image_unrefp(&p->state->replacement);
+        p->state->waiting_preview = false;
+        p->state->live_qualified = false;
+        p->state->warmed_samples = 0;
+        if (p->state->live) p->opts->policy = 1;
+        p->state->live = false;
+    }
     mp_mutex_lock(&p->lock);
     for (int n = 0; n < p->result_count; n++)
         release_result(&p->results[n]);
     p->result_count = 0;
     p->active_work = 0;
+    p->retry_admission = false;
     mp_cond_signal(&p->wakeup);
     mp_mutex_unlock(&p->lock);
     p->resets++;
+    update_state(p);
     MP_VERBOSE(f, "HDR generation reset to %llu\n", (unsigned long long)generation);
 }
 
@@ -343,32 +418,43 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
     struct priv *p = f->priv;
     CVPixelBufferRef buffer = (CVPixelBufferRef)image->planes[3];
     if (image->imgfmt != IMGFMT_VIDEOTOOLBOX || !buffer || image->source_pts == AV_NOPTS_VALUE ||
-        image->source_timebase_num <= 0 || image->source_timebase_den <= 0)
+        image->source_timebase_num <= 0 || image->source_timebase_den <= 0) {
+        MP_ERR(f, "Missing hardware buffer or rational decoder timing: format=%s pts=%lld timebase=%d/%d\n",
+            mp_imgfmt_to_name(image->imgfmt), (long long)image->source_pts,
+            image->source_timebase_num, image->source_timebase_den);
         return false;
+    }
     AVRational timebase = {image->source_timebase_num, image->source_timebase_den};
     double exact_pts = image->source_pts * av_q2d(timebase);
     // Filters that changed timeline semantics must provide a new rational identity.
-    if (fabs(exact_pts - image->pts) > 1e-9)
+    if (fabs(exact_pts - image->pts) > 1e-9) {
+        MP_ERR(f, "Decoder/source timeline differs: rational=%.12f playback=%.12f\n", exact_pts, image->pts);
         return false;
+    }
     int64_t pts;
     if (__builtin_mul_overflow(image->source_pts, (int64_t)timebase.num, &pts))
         return false;
-    int64_t duration;
+    fe_time frame_duration;
     if (image->source_duration > 0) {
+        int64_t duration;
         if (__builtin_mul_overflow(image->source_duration, (int64_t)timebase.num, &duration))
             return false;
+        frame_duration = (fe_time){duration, timebase.den};
     } else {
-        // mp_compute_frame_duration/decoder FPS may establish duration after decode.
+        // A container's PTS scale need not represent the nominal frame duration
+        // (e.g. 30 fps Matroska with millisecond PTS). Duration has its own exact
+        // rational denominator; never round it into the container PTS timebase.
         double seconds = image->pkt_duration > 0 ? image->pkt_duration :
                          image->nominal_fps > 0 ? 1 / image->nominal_fps : 0;
-        duration = llround(seconds * timebase.den);
-        if (duration <= 0 || fabs((double)duration / timebase.den - seconds) > 1e-9)
+        AVRational duration = av_d2q(seconds, INT32_MAX);
+        if (duration.num <= 0 || duration.den <= 0 || fabs(av_q2d(duration) - seconds) > 1e-9)
             return false;
+        frame_duration = (fe_time){duration.num, duration.den};
     }
     *frame = (fe_frame){ .struct_size = sizeof(*frame), .abi_version = FE_ABI_VERSION,
         .source_id = 1, .stream_id = 1, .frame_id = p->next_frame,
         .generation = fe_session_generation(p->session), .pts = {pts, timebase.den},
-        .duration = {duration, timebase.den}, .pixel_buffer = buffer,
+        .duration = frame_duration, .pixel_buffer = buffer,
         .pixel_format = CVPixelBufferGetPixelFormatType(buffer),
         .plane_count = (uint32_t)CVPixelBufferGetPlaneCount(buffer),
         .geometry = { .width = image->w, .height = image->h,
@@ -378,8 +464,11 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
             .pixel_aspect_num = image->params.p_w > 0 ? image->params.p_w : 1,
             .pixel_aspect_den = image->params.p_h > 0 ? image->params.p_h : 1 },
     };
-    if (!source_colour(p, image, &frame->colour) || frame->plane_count > 3)
+    if (!source_colour(p, image, &frame->colour) || frame->plane_count > 3) {
+        MP_ERR(f, "Unsupported source interpretation: %s chroma=%d planes=%u\n",
+               mp_image_params_to_str(&image->params), image->params.chroma_location, frame->plane_count);
         return false;
+    }
     for (int n = 0; n < frame->plane_count; n++) {
         frame->planes[n] = (fe_plane){ .width = CVPixelBufferGetWidthOfPlane(buffer, n),
             .height = CVPixelBufferGetHeightOfPlane(buffer, n),
@@ -432,8 +521,7 @@ static bool configure_measurements(struct mp_filter *f, struct mp_image *image)
 static void process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
-    if (!mp_pin_in_needs_data(f->ppins[1]))
-        return;
+    bool needs_output = mp_pin_in_needs_data(f->ppins[1]);
     mp_mutex_lock(&p->lock);
     if (p->failed) {
         MP_ERR(f, "HDR engine failed: %s\n", p->error);
@@ -442,7 +530,7 @@ static void process(struct mp_filter *f)
         return;
     }
     struct hdr_result output = {0};
-    if (p->result_count) {
+    if (p->result_count && (needs_output || (p->state && p->state->waiting_preview))) {
         output = p->results[0];
         memmove(p->results, p->results + 1, --p->result_count * sizeof(p->results[0]));
     }
@@ -487,12 +575,20 @@ static void process(struct mp_filter *f)
             av_buffer_unref(&image->async_generation);
             image->async_generation = av_buffer_ref(p->generation);
             image->async_frame_generation = output.frame.generation;
+            if (!mp_image_set_async_pair(image, pending.image)) {
+                talloc_free(image);
+                talloc_free(pending.image);
+                mp_filter_internal_mark_failed(f);
+                return;
+            }
             talloc_free(pending.image);
             p->emitted++;
             mp_mutex_lock(&p->lock);
             p->active_work--;
             mp_cond_signal(&p->wakeup);
             mp_mutex_unlock(&p->lock);
+            qualify_live(f, output.normalized_host - pending.submitted_host);
+            update_state(p);
             if (p->measurements) {
                 fprintf(p->measurements, "{\"event\":\"filter-output\",\"frame\":%llu,\"generation\":%llu,"
                     "\"pts_value\":%lld,\"pts_timescale\":%d,\"submitted_host\":%.9f,\"completed_host\":%.9f,"
@@ -502,12 +598,23 @@ static void process(struct mp_filter *f)
                     pending.submitted_host, output.normalized_host, output.normalization_gpu_seconds, output.peak_nits);
                 fflush(p->measurements);
             }
-            mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, image));
+            if (pending.preview && p->state) {
+                mp_image_unrefp(&p->state->replacement);
+                p->state->replacement = image;
+                // Core clears waiting_preview only after same-PTS VO replacement.
+                mp_filter_wakeup(f);
+            } else {
+                mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, image));
+            }
             return;
         }
         release_result(&output);
         mp_filter_internal_mark_progress(f);
     }
+    if (p->state && p->state->waiting_preview && !p->preview_emitted)
+        return;
+    if (!needs_output && !p->preview_emitted)
+        return;
     if (p->eof) {
         if (!p->pending_count) {
             mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
@@ -538,6 +645,14 @@ static void process(struct mp_filter *f)
         p->held_input = MP_NO_FRAME;
         return;
     }
+    // Preroll decoder frames reach mpv's accurate-seek selector immediately.
+    // They do not occupy inference slots or mutate temporal model history.
+    if (p->need_preview && p->state && p->state->seeking &&
+        image->pts < p->state->seek_target) {
+        mp_pin_in_write(f->ppins[1], p->held_input);
+        p->held_input = MP_NO_FRAME;
+        return;
+    }
     if (p->have_input_params && !mp_image_params_static_equal(&p->input_params, &image->params)) {
         struct mp_frame held = p->held_input;
         p->held_input = MP_NO_FRAME;
@@ -546,10 +661,33 @@ static void process(struct mp_filter *f)
     }
     p->input_params = image->params;
     p->have_input_params = true;
+    if (p->state) {
+        p->state->source_fps = image->nominal_fps;
+        p->state->source_width = image->w;
+        p->state->source_height = image->h;
+    }
     fe_frame frame;
     if (!descriptor(f, image, &frame) || !configure_measurements(f, image)) {
         MP_ERR(f, "metal-hdr requires VideoToolbox NV12/P010 input, supported colour metadata and unmodified rational decoder PTS\n");
         mp_filter_internal_mark_failed(f);
+        return;
+    }
+    av_buffer_unref(&image->async_generation);
+    image->async_generation = av_buffer_ref(p->generation);
+    image->async_frame_generation = frame.generation;
+    if (p->need_preview && p->state && !p->preview_emitted) {
+        struct mp_image *preview = mp_image_new_ref(image);
+        preview->async_original = true;
+        preview->async_preview = true;
+        p->preview_emitted = true;
+        p->state->waiting_preview = true;
+        mp_mutex_lock(&p->lock);
+        p->retry_admission = true;
+        mp_cond_signal(&p->wakeup);
+        mp_mutex_unlock(&p->lock);
+        update_state(p);
+        mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, preview));
+        mp_filter_internal_mark_progress(f);
         return;
     }
     fe_status status = fe_session_submit(p->session, &frame);
@@ -561,20 +699,53 @@ static void process(struct mp_filter *f)
         return;
     }
     p->pending[p->pending_count++] = (struct hdr_pending){ .frame_id = p->next_frame++,
-        .image = image, .submitted_host = CACurrentMediaTime() };
+        .image = image, .submitted_host = CACurrentMediaTime(), .preview = p->preview_emitted };
+    p->need_preview = false;
+    p->preview_emitted = false;
     p->held_input = MP_NO_FRAME;
     mp_mutex_lock(&p->lock);
     p->active_work++;
+    p->retry_admission = false;
     mp_cond_signal(&p->wakeup);
     mp_mutex_unlock(&p->lock);
+    update_state(p);
     mp_filter_internal_mark_progress(f);
 }
 
 static bool command(struct mp_filter *f, struct mp_filter_command *command)
 {
     struct priv *p = f->priv;
-    if (command->type != MP_FILTER_COMMAND_TEXT || strcmp(command->cmd, "bypass"))
+    if (command->type != MP_FILTER_COMMAND_TEXT)
         return false;
+    if (!strcmp(command->cmd, "compare")) {
+        struct mp_stream_info *info = mp_filter_find_stream_info(f);
+        if (!info || !info->dr_vo || !p->state || !p->state->user_paused)
+            return false;
+        bool original = !strcmp(command->arg, "original");
+        if (!original && strcmp(command->arg, "enhanced")) return false;
+        struct mp_image *current = vo_get_current_frame(info->dr_vo);
+        struct mp_image *variant = mp_image_async_variant(current, original);
+        bool ok = variant && vo_replace_current_frame(info->dr_vo, variant);
+        talloc_free(variant); talloc_free(current);
+        if (ok) { update_state(p); mp_filter_wakeup(f); }
+        return ok;
+    }
+    if (!strcmp(command->cmd, "policy")) {
+        if (!strcmp(command->arg, "live")) {
+            if (!p->state || !p->state->live_qualified || p->opts->bypass) {
+                MP_WARN(f, "Live requires a qualified non-tiny neural session: 60 warmed completions with 20%% source-deadline headroom\n");
+                return false;
+            }
+            p->opts->policy = 0; p->state->live = true;
+        } else if (!strcmp(command->arg, "adaptive") || !strcmp(command->arg, "direct")) {
+            p->opts->policy = !strcmp(command->arg, "adaptive");
+            if (p->state) p->state->live = false;
+        } else return false;
+        update_state(p);
+        mp_filter_wakeup(f);
+        return true;
+    }
+    if (strcmp(command->cmd, "bypass")) return false;
     bool bypass;
     if (!strcmp(command->arg, "yes")) bypass = true;
     else if (!strcmp(command->arg, "no")) bypass = false;
@@ -582,6 +753,7 @@ static bool command(struct mp_filter *f, struct mp_filter_command *command)
     if (bypass != p->opts->bypass) {
         reset(f);
         p->opts->bypass = bypass;
+        update_state(p);
         mp_filter_wakeup(f);
     }
     return true;
@@ -592,6 +764,10 @@ static void destroy(struct mp_filter *f)
     struct priv *p = f->priv;
     if (p->generation)
         atomic_fetch_add((_Atomic uint64_t *)p->generation->data, 1);
+    if (p->state && p->state->owner == p) {
+        mp_image_unrefp(&p->state->replacement);
+        *p->state = (struct mp_async_video_state){ .revision = p->state->revision + 1 };
+    }
     if (p->session)
         fe_session_close(p->session);
     mp_mutex_lock(&p->lock);
@@ -646,6 +822,16 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     if (!f) { talloc_free(options); return NULL; }
     struct priv *p = f->priv;
     p->opts = talloc_steal(p, options);
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    p->state = info ? info->async_video : NULL;
+    if (p->state) {
+        mp_image_unrefp(&p->state->replacement);
+        p->state->waiting_preview = false;
+        p->state->live = p->state->live_qualified = false;
+        p->state->warmed_samples = 0;
+        p->state->owner = p;
+    }
+    p->need_preview = true;
     mp_mutex_init(&p->lock); mp_cond_init(&p->wakeup);
     mp_filter_add_pin(f, MP_PIN_IN, "in");
     mp_filter_add_pin(f, MP_PIN_OUT, "out");
@@ -662,6 +848,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     if (!p->generation) goto error;
     atomic_init((_Atomic uint64_t *)p->generation->data, fe_session_generation(p->session));
     p->device = MTLCreateSystemDefaultDevice();
+    if (p->state) p->state->hardware = talloc_strdup(p, p->device.name.UTF8String);
     p->queue = [p->device newCommandQueue];
     NSError *error = nil;
     id<MTLLibrary> library = [p->device newLibraryWithSource:normalization_shader options:nil error:&error];
@@ -683,6 +870,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     }
     if (mp_thread_create(&p->thread, poll_worker, f)) goto error;
     p->thread_started = true;
+    update_state(p);
     MP_INFO(f, "Persistent HDR engine active (%s); three slots; RGBA16F/BT.2020 output, one GPU unit-normalization pass\n",
             config.model_path ? "neural model" : "HDR original");
     return f;
@@ -702,6 +890,7 @@ static const m_option_t options[] = {
     {"reference-white", OPT_DOUBLE(reference_white), M_RANGE(1, 1000)},
     {"hlg-peak", OPT_DOUBLE(hlg_peak), M_RANGE(400, 2000)},
     {"maximum-luminance-ratio", OPT_DOUBLE(maximum_luminance_ratio), M_RANGE(1, 16)},
+    {"policy", OPT_CHOICE(policy, {"direct", 0}, {"adaptive", 1})},
     {"bypass", OPT_BOOL(bypass)}, {0},
 };
 

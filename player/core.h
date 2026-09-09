@@ -435,6 +435,9 @@ typedef struct MPContext {
     int remaining_ab_loops;
 
     bool paused_for_cache;
+    bool paused_for_enhancement;
+    uint64_t enhancement_revision, enhancement_buffer_count;
+    double enhancement_buffer_start, enhancement_buffer_seconds;
     bool demux_underrun;
     double cache_stop_time;
     int cache_buffer;

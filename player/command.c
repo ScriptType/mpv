@@ -1698,6 +1698,59 @@ static int mp_property_paused_for_cache(void *ctx, struct m_property *prop,
     return m_property_bool_ro(action, arg, mpctx->paused_for_cache);
 }
 
+static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
+                                          int action, void *arg)
+{
+    MPContext *mpctx = ctx;
+    if (action == M_PROPERTY_GET_TYPE) {
+        *(struct m_option *)arg = (struct m_option){.type = CONF_TYPE_NODE};
+        return M_PROPERTY_OK;
+    }
+    if (action != M_PROPERTY_GET) return M_PROPERTY_NOT_IMPLEMENTED;
+    struct mp_async_video_state empty = {0};
+    struct mp_async_video_state *s = mpctx->vo_chain ?
+        &mpctx->vo_chain->filter->async_video : &empty;
+    struct mpv_node *r = arg;
+    node_init(r, MPV_FORMAT_NODE_MAP, NULL);
+    node_map_add_string(r, "policy", !s->active ? "bypass" :
+                        s->live ? "live" : s->adaptive ? "adaptive" : "direct");
+    node_map_add_flag(r, "buffering", mpctx->paused_for_enhancement);
+    node_map_add_flag(r, "preview-pending", s->waiting_preview);
+    node_map_add_flag(r, "live-qualified", s->live_qualified);
+    node_map_add_int64(r, "pending-frames", s->pending);
+    node_map_add_int64(r, "generation", s->generation);
+    node_map_add_int64(r, "processing-width", s->processing_width);
+    node_map_add_int64(r, "processing-height", s->processing_height);
+    node_map_add_int64(r, "warmed-samples", s->warmed_samples);
+    node_map_add_int64(r, "submitted-frames", s->submitted_frames);
+    node_map_add_int64(r, "completed-frames", s->completed_frames);
+    node_map_add_int64(r, "source-width", s->source_width);
+    node_map_add_int64(r, "source-height", s->source_height);
+    node_map_add_double(r, "strength", s->strength);
+    node_map_add_double(r, "colour-strength", s->colour_strength);
+    node_map_add_string(r, "model", s->model ? s->model : "original");
+    node_map_add_string(r, "hardware", s->hardware ? s->hardware : "unavailable");
+    node_map_add_double(r, "completed-p95-seconds", s->completed_p95);
+    node_map_add_double(r, "source-fps", s->source_fps);
+    node_map_add_int64(r, "buffer-count", mpctx->enhancement_buffer_count);
+    double buffered = mpctx->enhancement_buffer_seconds;
+    if (mpctx->paused_for_enhancement)
+        buffered += mp_time_sec() - mpctx->enhancement_buffer_start;
+    node_map_add_double(r, "buffer-seconds", buffered);
+    struct mp_image *current = mpctx->video_out ? vo_get_current_frame(mpctx->video_out) : NULL;
+    node_map_add_flag(r, "compare-ready", current && current->async_pair &&
+                      mp_image_is_current(current) && mpctx->opts->pause);
+    node_map_add_string(r, "comparison", current && current->async_original ? "original" : "enhanced");
+    if (current && current->async_generation) {
+        node_map_add_int64(r, "displayed-source-pts", current->source_pts);
+        node_map_add_int64(r, "displayed-timebase-num", current->source_timebase_num);
+        node_map_add_int64(r, "displayed-timebase-den", current->source_timebase_den);
+        node_map_add_int64(r, "displayed-generation", current->async_frame_generation);
+    }
+    talloc_free(current);
+    return M_PROPERTY_OK;
+}
+
 static int mp_property_cache_buffering(void *ctx, struct m_property *prop,
                                        int action, void *arg)
 {
@@ -4704,6 +4757,7 @@ static const struct m_property mp_properties_base[] = {
     {"demuxer-cache-state", mp_property_demuxer_cache_state},
     {"cache-buffering-state", mp_property_cache_buffering},
     {"paused-for-cache", mp_property_paused_for_cache},
+    {"enhancement-state", mp_property_enhancement_state},
     {"demuxer-via-network", mp_property_demuxer_is_network},
     {"clock", mp_property_clock},
     {"seekable", mp_property_seekable},

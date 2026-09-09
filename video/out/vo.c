@@ -1472,6 +1472,55 @@ struct mp_image *vo_get_current_frame(struct vo *vo)
     return r;
 }
 
+static void run_replace_current(void *argument)
+{
+    void **args = argument;
+    struct vo *vo = args[0];
+    struct mp_image *image = args[1];
+    bool *result = args[2];
+    struct vo_internal *in = vo->in;
+    // gpu-next accepts the per-frame NV12/P010 and float hardware formats. A
+    // replacement must not discard a queued later frame or change geometry.
+    if (strcmp(vo->driver->name, "gpu-next")) return;
+    mp_mutex_lock(&in->lock);
+    struct mp_image *current = in->current_frame ? in->current_frame->current : NULL;
+    bool matches = !in->frame_queued && mp_image_same_async_identity(current, image) &&
+        current->w == image->w && current->h == image->h;
+    struct vo_frame *frame = matches ? vo_frame_ref(in->current_frame) : NULL;
+    mp_mutex_unlock(&in->lock);
+    if (!frame) return;
+    // Reconfigure colour interpretation on the renderer thread. The frame keeps
+    // its media timestamp; only the renderer cache identity changes.
+    int status;
+    void *config[] = {vo, image, &status};
+    run_reconfig(config);
+    if (status < 0) { talloc_free(frame); return; }
+    for (int n = 0; n < frame->num_frames; n++) talloc_free(frame->frames[n]);
+    frame->num_frames = 1;
+    frame->frames[0] = mp_image_new_ref(image);
+    frame->current = frame->frames[0];
+    frame->repeat = false;
+    frame->still = true;
+    vo->driver->control(vo, VOCTRL_RESET, NULL);
+    mp_mutex_lock(&in->lock);
+    frame->frame_id = ++in->current_frame_id;
+    in->current_frame = frame;
+    in->hasframe = true;
+    in->request_redraw = true;
+    wakeup_locked(vo);
+    mp_mutex_unlock(&in->lock);
+    *result = true;
+    wakeup_core(vo);
+}
+
+bool vo_replace_current_frame(struct vo *vo, struct mp_image *image)
+{
+    bool result = false;
+    void *args[] = {vo, image, &result};
+    mp_dispatch_run(vo->in->dispatch, run_replace_current, args);
+    return result;
+}
+
 struct vo_frame *vo_get_current_vo_frame(struct vo *vo)
 {
     struct vo_internal *in = vo->in;

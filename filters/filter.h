@@ -397,6 +397,22 @@ bool mp_filter_command(struct mp_filter *f, struct mp_filter_command *cmd);
 
 // Specific information about a sub-tree in a filter graph. Currently, this is
 // mostly used to give filters access to VO mechanisms and capabilities.
+// All fields are owned by the playback/filter thread, never the GPU worker.
+struct mp_async_video_state {
+    void *owner;
+    bool active, adaptive, live, live_qualified, waiting_preview;
+    bool seeking, user_paused; // inputs supplied by the playback core
+    double seek_target;
+    int pending, processing_width, processing_height;
+    uint64_t generation, warmed_samples, revision;
+    uint64_t submitted_frames, completed_frames;
+    double completed_p95, source_fps;
+    double strength, colour_strength;
+    int source_width, source_height;
+    const char *model, *hardware;
+    struct mp_image *replacement; // one owned, supersedable same-PTS update
+};
+
 struct mp_stream_info {
     void *priv; // for use by whoever implements the callbacks
 
@@ -409,6 +425,7 @@ struct mp_stream_info {
     bool rotate90;
     bool force_swdec;
     struct vo *dr_vo; // for calling vo_get_image()
+    struct mp_async_video_state *async_video;
 };
 
 // Search for a parent filter (including f) that has this set, and return it.

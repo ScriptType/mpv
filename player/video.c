@@ -45,6 +45,7 @@
 #include "core.h"
 #include "command.h"
 #include "screenshot.h"
+#include "client.h"
 
 enum {
     // update_video() - code also uses: <0 error, 0 eof, >0 progress
@@ -98,6 +99,11 @@ static void vo_chain_reset_state(struct vo_chain *vo_c)
 
 void reset_video_state(struct MPContext *mpctx)
 {
+    if (mpctx->paused_for_enhancement) {
+        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+        mpctx->paused_for_enhancement = false;
+        update_internal_pause_state(mpctx);
+    }
     if (mpctx->vo_chain) {
         vo_chain_reset_state(mpctx->vo_chain);
         struct track *t = mpctx->vo_chain->track;
@@ -325,6 +331,11 @@ void mp_force_video_refresh(struct MPContext *mpctx)
 static void check_framedrop(struct MPContext *mpctx, struct vo_chain *vo_c)
 {
     struct MPOpts *opts = mpctx->opts;
+    if (vo_c->filter->async_video.adaptive) {
+        if (vo_c->track && vo_c->track->dec)
+            mp_decoder_wrapper_set_frame_drops(vo_c->track->dec, 0);
+        return;
+    }
     // check for frame-drop:
     if (mpctx->video_status == STATUS_PLAYING && !mpctx->paused &&
         mpctx->audio_status == STATUS_PLAYING && !ao_untimed(mpctx->ao) &&
@@ -426,6 +437,11 @@ static bool use_video_lookahead(struct MPContext *mpctx)
 
 static int get_req_frames(struct MPContext *mpctx, bool eof)
 {
+    // Async policy uses packet duration and bounds lookahead independently of
+    // renderer interpolation. In particular, a seek preview never waits for a
+    // second enhanced frame before it can be shown.
+    if (mpctx->vo_chain && mpctx->vo_chain->filter->async_video.active)
+        return 1;
     // On EOF, drain all frames.
     if (eof)
         return 1;
@@ -1051,6 +1067,53 @@ void write_video(struct MPContext *mpctx)
     struct track *track = mpctx->vo_chain->track;
     struct vo_chain *vo_c = mpctx->vo_chain;
     struct vo *vo = vo_c->vo;
+    struct mp_async_video_state *async = &vo_c->filter->async_video;
+    async->user_paused = opts->pause;
+    async->seeking = mpctx->video_status == STATUS_SYNCING && mpctx->hrseek_active;
+    async->seek_target = mpctx->hrseek_pts - (mpctx->hrseek_backstep ? 0 : .005);
+
+    if (async->replacement) {
+        struct mp_image *current = vo_get_current_frame(vo);
+        if (mp_image_same_async_identity(current, async->replacement)) {
+            if (vo_replace_current_frame(vo, async->replacement)) {
+                MP_VERBOSE(mpctx, "Enhanced seek replacement at exact source PTS %"PRId64"/%d generation %"PRIu64"\n",
+                    current->source_pts, current->source_timebase_den, current->async_frame_generation);
+                mp_image_unrefp(&async->replacement);
+                async->waiting_preview = false;
+                async->revision++;
+                mp_wakeup_core(mpctx);
+                mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
+            }
+        } else if (current && !current->async_preview) {
+            mp_image_unrefp(&async->replacement);
+            async->waiting_preview = false;
+            async->revision++;
+        }
+        talloc_free(current);
+    }
+    if (mpctx->enhancement_revision != async->revision) {
+        mpctx->enhancement_revision = async->revision;
+        mp_client_property_change(mpctx, "enhancement-state");
+    }
+
+    // A preview is shown while both clocks remain held until its matching
+    // enhanced result is ready. User pause remains a separate state.
+    bool preview_wait = async->active && async->waiting_preview && vo_has_frame(vo);
+    bool keep_buffering = preview_wait ||
+        (async->adaptive && mpctx->paused_for_enhancement && !mpctx->num_next_frames);
+    if ((!async->active || !keep_buffering) && mpctx->paused_for_enhancement) {
+        mpctx->paused_for_enhancement = false;
+        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+        update_internal_pause_state(mpctx);
+        mp_client_property_change(mpctx, "enhancement-state");
+    }
+    if (preview_wait && !mpctx->paused_for_enhancement) {
+        mpctx->paused_for_enhancement = true;
+        mpctx->enhancement_buffer_start = mp_time_sec();
+        mpctx->enhancement_buffer_count++;
+        update_internal_pause_state(mpctx);
+        mp_client_property_change(mpctx, "enhancement-state");
+    }
 
     if (vo_c->filter->reconfig_happened) {
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
@@ -1061,7 +1124,8 @@ void write_video(struct MPContext *mpctx)
     if (mpctx->video_status == STATUS_READY)
         return;
 
-    if (mpctx->paused && mpctx->video_status >= STATUS_READY)
+    if ((opts->pause || mpctx->paused_for_cache || preview_wait) &&
+        mpctx->video_status >= STATUS_READY)
         return;
 
     bool logical_eof = false;
@@ -1078,6 +1142,19 @@ void write_video(struct MPContext *mpctx)
         mpctx->video_status = STATUS_SYNCING;
 
     if (r == VD_WAIT) {
+        if (async->adaptive && mpctx->video_status == STATUS_PLAYING &&
+            !mpctx->paused_for_enhancement) {
+            if (vo_still_displaying(vo)) {
+                vo_request_wakeup_on_done(vo);
+            } else {
+                mpctx->paused_for_enhancement = true;
+                mpctx->enhancement_buffer_start = mp_time_sec();
+                mpctx->enhancement_buffer_count++;
+                update_internal_pause_state(mpctx);
+                mp_client_property_change(mpctx, "enhancement-state");
+                MP_VERBOSE(mpctx, "Adaptive enhancement buffer: both playback clocks paused\n");
+            }
+        }
         // Heuristic to detect underruns.
         if (mpctx->video_status == STATUS_PLAYING && !vo_still_displaying(vo) &&
             !vo_c->underrun_signaled)
@@ -1090,6 +1167,11 @@ void write_video(struct MPContext *mpctx)
     }
 
     if (r == VD_EOF) {
+        if (mpctx->paused_for_enhancement) {
+            mpctx->paused_for_enhancement = false;
+            mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+            update_internal_pause_state(mpctx);
+        }
         if (check_for_hwdec_fallback(mpctx))
             return;
         if (check_for_forced_eof(mpctx)) {
@@ -1148,6 +1230,12 @@ void write_video(struct MPContext *mpctx)
     if (r != VD_NEW_FRAME) {
         mp_wakeup_core(mpctx); // Decode more in next iteration.
         return;
+    }
+    if (mpctx->paused_for_enhancement) {
+        mpctx->paused_for_enhancement = false;
+        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+        update_internal_pause_state(mpctx);
+        mp_client_property_change(mpctx, "enhancement-state");
     }
 
     // A sparse still-image stream may have no frame at the seek target.
@@ -1270,7 +1358,7 @@ void write_video(struct MPContext *mpctx)
         .pts = pts,
         .duration = -1,
         .still = mpctx->step_frames > 0,
-        .can_drop = opts->frame_dropping & 1,
+        .can_drop = !async->adaptive && (opts->frame_dropping & 1),
         .num_frames = MPMIN(mpctx->num_next_frames, req),
         .num_vsyncs = 1,
     };

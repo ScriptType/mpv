@@ -701,6 +701,7 @@ static void create_video_things(struct chain *p)
     p->stream_info.priv = p;
     p->stream_info.get_display_fps = get_display_fps;
     p->stream_info.get_display_res = get_display_res;
+    p->stream_info.async_video = &p->public.async_video;
 
     p->f->stream_info = &p->stream_info;
 

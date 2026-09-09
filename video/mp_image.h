@@ -111,6 +111,8 @@ typedef struct mp_image {
     /* Optional reference-counted atomic generation for late presentation checks. */
     struct AVBufferRef *async_generation;
     uint64_t async_frame_generation;
+    struct AVBufferRef *async_pair; // immutable retained original/enhanced pair
+    bool async_original, async_preview;
     /* container reported FPS; can be incorrect, or 0 if unknown */
     double nominal_fps;
     /* for private use */
@@ -160,6 +162,9 @@ struct mp_image *mp_image_new_copy(struct mp_image *img);
 struct mp_image *mp_image_new_ref(struct mp_image *img);
 bool mp_image_is_writeable(struct mp_image *img);
 bool mp_image_is_current(struct mp_image *img);
+bool mp_image_same_async_identity(struct mp_image *a, struct mp_image *b);
+bool mp_image_set_async_pair(struct mp_image *enhanced, struct mp_image *original);
+struct mp_image *mp_image_async_variant(struct mp_image *image, bool original);
 bool mp_image_make_writeable(struct mp_image *img);
 void mp_image_setrefp(struct mp_image **p_img, struct mp_image *new_value);
 void mp_image_unrefp(struct mp_image **p_img);

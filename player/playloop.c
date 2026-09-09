@@ -157,7 +157,7 @@ void update_core_idle_state(struct MPContext *mpctx)
 
 bool get_internal_paused(struct MPContext *mpctx)
 {
-    return mpctx->opts->pause || mpctx->paused_for_cache;
+    return mpctx->opts->pause || mpctx->paused_for_cache || mpctx->paused_for_enhancement;
 }
 
 // The value passed here is the new value for mpctx->opts->pause
@@ -166,6 +166,9 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
     struct MPOpts *opts = mpctx->opts;
 
     opts->pause = user_pause;
+    if (mpctx->vo_chain)
+        mpctx->vo_chain->filter->async_video.user_paused = user_pause;
+    mp_client_property_change(mpctx, "enhancement-state");
 
     bool internal_paused = get_internal_paused(mpctx);
     if (internal_paused != mpctx->paused) {
@@ -285,6 +288,7 @@ void reset_playback_state(struct MPContext *mpctx)
     mpctx->ab_loop_clip = true;
     mpctx->restart_complete = false;
     mpctx->paused_for_cache = false;
+    mpctx->paused_for_enhancement = false;
     mpctx->cache_buffer = 100;
     mpctx->cache_update_pts = MP_NOPTS_VALUE;
 

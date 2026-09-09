@@ -30,6 +30,7 @@ struct mp_output_chain {
     // --- for type==MP_OUTPUT_CHAIN_VIDEO
     struct mp_image_params input_params;
     struct mp_image_params output_params;
+    struct mp_async_video_state async_video;
     double container_fps;
     void (*update_subtitles)(void *ctx, double pts);
     void *update_subtitles_ctx;

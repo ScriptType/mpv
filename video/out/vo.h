@@ -549,6 +549,9 @@ void vo_query_formats(struct vo *vo, uint8_t *list);
 void vo_event(struct vo *vo, int event);
 int vo_query_and_reset_events(struct vo *vo, int events);
 struct mp_image *vo_get_current_frame(struct vo *vo);
+// Replace pixels of the exact current async source identity without advancing
+// playback time. Executed on the VO thread; caller retains image ownership.
+bool vo_replace_current_frame(struct vo *vo, struct mp_image *image);
 void vo_set_queue_params(struct vo *vo, int64_t offset_ns, int num_req_frames,
                          int num_frame_refs);
 int vo_get_num_req_frames(struct vo *vo);

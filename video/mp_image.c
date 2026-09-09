@@ -236,6 +236,7 @@ static void mp_image_destructor(void *ptr)
     av_buffer_unref(&mpi->dovi);
     av_buffer_unref(&mpi->film_grain);
     av_buffer_unref(&mpi->async_generation);
+    av_buffer_unref(&mpi->async_pair);
     for (int n = 0; n < mpi->num_ff_side_data; n++)
         av_buffer_unref(&mpi->ff_side_data[n].buf);
     talloc_free(mpi->ff_side_data);
@@ -355,6 +356,62 @@ bool mp_image_is_current(struct mp_image *img)
         atomic_load((_Atomic uint64_t *)img->async_generation->data) == img->async_frame_generation;
 }
 
+bool mp_image_same_async_identity(struct mp_image *a, struct mp_image *b)
+{
+    return a && b && mp_image_is_current(a) && mp_image_is_current(b) &&
+        a->async_generation && b->async_generation &&
+        a->async_generation->data == b->async_generation->data &&
+        a->async_frame_generation == b->async_frame_generation &&
+        a->source_timebase_num > 0 && a->source_timebase_den > 0 &&
+        b->source_timebase_num > 0 && b->source_timebase_den > 0 &&
+        (__int128)a->source_pts * a->source_timebase_num * b->source_timebase_den ==
+        (__int128)b->source_pts * b->source_timebase_num * a->source_timebase_den;
+}
+
+struct async_pair { struct mp_image *original, *enhanced; };
+
+static void free_async_pair(void *opaque, uint8_t *data)
+{
+    struct async_pair *pair = (void *)data;
+    talloc_free(pair->original);
+    talloc_free(pair->enhanced);
+    free(pair);
+}
+
+bool mp_image_set_async_pair(struct mp_image *enhanced, struct mp_image *original)
+{
+    if (!mp_image_same_async_identity(enhanced, original))
+        return false;
+    struct async_pair *pair = calloc(1, sizeof(*pair));
+    if (!pair)
+        return false;
+    pair->original = mp_image_new_ref(original);
+    pair->enhanced = mp_image_new_ref(enhanced);
+    // The pair owns pixel references, never references back to itself.
+    av_buffer_unref(&pair->original->async_pair);
+    av_buffer_unref(&pair->enhanced->async_pair);
+    AVBufferRef *owner = av_buffer_create((void *)pair, sizeof(*pair),
+                                         free_async_pair, NULL, 0);
+    if (!owner) { free_async_pair(NULL, (void *)pair); return false; }
+    av_buffer_unref(&enhanced->async_pair);
+    enhanced->async_pair = owner;
+    enhanced->async_original = false;
+    enhanced->async_preview = false;
+    return true;
+}
+
+struct mp_image *mp_image_async_variant(struct mp_image *image, bool original)
+{
+    if (!image || !image->async_pair || !mp_image_is_current(image))
+        return NULL;
+    struct async_pair *pair = (void *)image->async_pair->data;
+    struct mp_image *variant = mp_image_new_ref(original ? pair->original : pair->enhanced);
+    variant->async_pair = av_buffer_ref(image->async_pair);
+    variant->async_original = original;
+    variant->async_preview = false;
+    return variant;
+}
+
 // Return a new reference to img. The returned reference is owned by the caller,
 // while img is left untouched.
 struct mp_image *mp_image_new_ref(struct mp_image *img)
@@ -378,6 +435,7 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
     ref_buffer(&new->dovi);
     ref_buffer(&new->film_grain);
     ref_buffer(&new->async_generation);
+    ref_buffer(&new->async_pair);
 
     new->ff_side_data = talloc_memdup(NULL, new->ff_side_data,
                         new->num_ff_side_data * sizeof(new->ff_side_data[0]));
@@ -419,6 +477,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
     new->dovi = NULL;
     new->film_grain = NULL;
     new->async_generation = NULL;
+    new->async_pair = NULL;
     new->num_ff_side_data = 0;
     new->ff_side_data = NULL;
     new->enhancement_layer = NULL;
@@ -563,6 +622,9 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->source_timebase_den = src->source_timebase_den;
     assign_bufref(&dst->async_generation, src->async_generation);
     dst->async_frame_generation = src->async_frame_generation;
+    assign_bufref(&dst->async_pair, src->async_pair);
+    dst->async_original = src->async_original;
+    dst->async_preview = src->async_preview;
     dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;
