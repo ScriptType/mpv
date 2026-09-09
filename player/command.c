@@ -1714,6 +1714,9 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     struct mpv_node *r = arg;
     node_init(r, MPV_FORMAT_NODE_MAP, NULL);
     node_map_add_flag(r, "prepared-supported", HAVE_FRAME_ENGINE);
+    node_map_add_flag(r, "source-dolby-vision", s->source_dovi);
+    node_map_add_string(r, "native-color-path", s->native_color_path ? s->native_color_path : "standard");
+    node_map_add_string(r, "enhancement-unavailable-reason", s->enhancement_unavailable_reason ? s->enhancement_unavailable_reason : "");
     node_map_add_string(r, "policy", !s->active ? "bypass" : s->prepared_json ? "prepared" :
                         s->live ? "live" : s->adaptive ? "adaptive" : "direct");
     node_map_add_flag(r, "buffering", mpctx->paused_for_enhancement);
@@ -1748,6 +1751,8 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         buffered += mp_time_sec() - mpctx->enhancement_buffer_start;
     node_map_add_double(r, "buffer-seconds", buffered);
     struct mp_image *current = mpctx->video_out ? vo_get_current_frame(mpctx->video_out) : NULL;
+    node_map_add_flag(r, "displayed-dolby-vision-metadata", current &&
+                      current->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && current->dovi);
     node_map_add_flag(r, "compare-ready", current && current->async_pair &&
                       mp_image_is_current(current) && mpctx->opts->pause);
     node_map_add_string(r, "comparison", current && current->async_original ? "original" : "enhanced");
@@ -2270,6 +2275,8 @@ static int get_track_entry(int item, int action, void *arg, void *ctx)
         {"dolby-vision-profile", SUB_PROP_INT(p.dv_profile),
                         .unavailable = !p.dovi},
         {"dolby-vision-level", SUB_PROP_INT(p.dv_level),
+                        .unavailable = !p.dovi},
+        {"dolby-vision-compatibility-id", SUB_PROP_INT(p.dv_bl_compatibility_id),
                         .unavailable = !p.dovi},
         {"metadata", SUB_PROP_KEYVALUE_LIST(tag_list),
                         .unavailable = !tags->num_keys},

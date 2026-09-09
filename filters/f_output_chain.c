@@ -403,12 +403,25 @@ void mp_output_chain_set_vo(struct mp_output_chain *c, struct vo *vo)
 }
 
 void mp_output_chain_set_source(struct mp_output_chain *c, const char *path,
-                                 int video_ordinal)
+                                 int video_ordinal, const char *demuxer,
+                                 double timestamp_offset)
 {
     struct chain *p = c->f->priv;
     talloc_free((void *)p->stream_info.source_path);
     p->stream_info.source_path = path ? talloc_strdup(p, path) : NULL;
+    talloc_free((void *)p->stream_info.source_demuxer);
+    p->stream_info.source_demuxer = demuxer ? talloc_strdup(p, demuxer) : NULL;
+    p->stream_info.source_timestamp_offset = timestamp_offset;
     p->stream_info.video_ordinal = video_ordinal;
+}
+
+void mp_output_chain_set_dovi(struct mp_output_chain *c, int profile, int level,
+                                int compatibility_id)
+{
+    struct chain *p = c->f->priv;
+    p->stream_info.dovi_profile = profile;
+    p->stream_info.dovi_level = level;
+    p->stream_info.dovi_compatibility_id = compatibility_id;
 }
 
 void mp_output_chain_set_el_stream(struct mp_output_chain *c,

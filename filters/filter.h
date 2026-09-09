@@ -411,6 +411,8 @@ struct mp_async_video_state {
     int source_width, source_height;
     const char *model, *hardware;
     const char *prepared_json;
+    bool source_dovi;
+    const char *native_color_path, *enhancement_unavailable_reason;
     struct mp_image *replacement; // one owned, supersedable same-PTS update
 };
 
@@ -428,7 +430,10 @@ struct mp_stream_info {
     struct vo *dr_vo; // for calling vo_get_image()
     struct mp_async_video_state *async_video;
     const char *source_path; // supplied by the opened playback core, not options
+    const char *source_demuxer; // actual demuxer class, including native Matroska
+    double source_timestamp_offset; // opened core's applied source timeline offset
     int video_ordinal; // index among this demuxer's video streams; -1 if unknown
+    int dovi_profile, dovi_level, dovi_compatibility_id;
 };
 
 // Search for a parent filter (including f) that has this set, and return it.

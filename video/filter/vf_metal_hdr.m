@@ -11,6 +11,7 @@
 #include <stdio.h>
 
 #include <libavutil/buffer.h>
+#include <libavutil/frame.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/rational.h>
 #include <frame_engine.h>
@@ -24,6 +25,7 @@
 #include "osdep/threads.h"
 #include "video/mp_image.h"
 #include "video/out/vo.h"
+#include "video/filter/metal_hdr_decoder.h"
 
 #define HDR_SLOTS 3
 #define HDR_POOL_BUFFERS 6
@@ -85,6 +87,7 @@ struct priv {
     AVBufferRef *generation;
     struct mp_image_params input_params;
     bool have_input_params;
+    bool dovi_detected, interpretation_rejected;
     id<MTLDevice> device;
     id<MTLCommandQueue> queue;
     id<MTLComputePipelineState> normalize;
@@ -121,8 +124,8 @@ static void update_state(struct priv *p)
 {
     if (!p->state || p->state->owner != p)
         return;
-    p->state->active = !p->opts->bypass;
-    p->state->adaptive = p->opts->policy == 1 && !p->opts->bypass;
+    p->state->active = !p->opts->bypass && !p->dovi_detected;
+    p->state->adaptive = p->opts->policy == 1 && p->state->active;
     p->state->pending = p->pending_count + (p->preview_emitted ? 1 : 0);
     p->state->generation = fe_session_generation(p->session);
     p->state->processing_width = p->opts->processing_width;
@@ -371,6 +374,7 @@ static void reset(struct mp_filter *f)
         talloc_free(p->pending[n].image);
     p->pending_count = 0;
     p->eof = false;
+    p->interpretation_rejected = false;
     p->have_input_params = false;
     p->need_preview = true;
     p->preview_emitted = false;
@@ -396,11 +400,71 @@ static void reset(struct mp_filter *f)
     MP_VERBOSE(f, "HDR generation reset to %llu\n", (unsigned long long)generation);
 }
 
-static bool source_colour(struct priv *p, struct mp_image *image, fe_colour *colour)
+// Dolby Vision code values must reach gpu-next's metadata-driven decode before
+// any linear-light neural operation. This filter does not implement that decode.
+// Never strip RPU/FEL metadata or reinterpret an incompatible base layer as PQ.
+static int native_dovi_path(struct mp_filter *f, struct mp_image *image)
+{
+    struct priv *p = f->priv;
+    struct mp_stream_info *info = mp_filter_find_stream_info(f);
+    int profile = info ? info->dovi_profile : 0;
+    int compatibility = info ? info->dovi_compatibility_id : 0;
+    bool mapped = image->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION && image->dovi;
+    bool side_data = false;
+    for (int n = 0; n < image->num_ff_side_data; n++) {
+        int type = image->ff_side_data[n].type;
+        side_data |= type == AV_FRAME_DATA_DOVI_METADATA || type == AV_FRAME_DATA_DOVI_RPU_BUFFER;
+    }
+    bool detected = profile || image->dovi || side_data ||
+                    image->params.repr.sys == PL_COLOR_SYSTEM_DOLBYVISION;
+    if (detected != p->dovi_detected) {
+        struct mp_frame held = p->held_input;
+        p->held_input = MP_NO_FRAME;
+        reset(f);
+        p->held_input = held;
+        p->dovi_detected = detected;
+        if (detected && p->prepared) fe_prepared_cancel(p->prepared);
+    }
+    const char *path = "standard", *reason = NULL;
+    int result = 0;
+    if (detected) {
+        result = 1;
+        bool known_profile = !profile || profile == 5 || profile == 7 || profile == 8;
+        bool compatible_yuv = image->params.color.primaries == PL_COLOR_PRIM_BT_2020 &&
+                              image->params.repr.sys == PL_COLOR_SYSTEM_BT_2020_NC;
+        if (mapped && known_profile) {
+            path = "native-dolby-vision";
+            reason = "Dolby Vision stays in the native renderer; neural enhancement is not qualified.";
+        } else if (profile == 8 && compatibility == 1 && compatible_yuv &&
+                   image->params.color.transfer == PL_COLOR_TRC_PQ) {
+            path = "hdr10-base-layer";
+            reason = "Dolby Vision metadata is unavailable; playing its declared HDR10-compatible base layer without neural enhancement.";
+        } else if (profile == 8 && compatibility == 4 && compatible_yuv &&
+                   image->params.color.transfer == PL_COLOR_TRC_HLG) {
+            path = "hlg-base-layer";
+            reason = "Dolby Vision metadata is unavailable; playing its declared HLG-compatible base layer without neural enhancement.";
+        } else {
+            path = "unsupported-dolby-vision";
+            reason = "Dolby Vision lacks a supported metadata path or a verified compatible base layer.";
+            result = -1;
+        }
+    }
+    if (p->state) {
+        p->state->source_dovi = detected;
+        p->state->native_color_path = path;
+        p->state->enhancement_unavailable_reason = reason;
+    }
+    update_state(p);
+    if (result < 0) MP_ERR(f, "%s\n", reason);
+    return result;
+}
+
+static bool source_colour(struct mp_image *image, fe_colour *colour,
+                          double reference_white, double hlg_peak)
 {
     const struct mp_image_params *params = &image->params;
-    *colour = (fe_colour){ .reference_white_nits = p->opts->reference_white,
-                           .hlg_peak_nits = p->opts->hlg_peak };
+    *colour = (fe_colour){ .reference_white_nits = reference_white,
+                           .hlg_peak_nits = hlg_peak };
     switch (params->color.primaries) {
     case PL_COLOR_PRIM_BT_2020: colour->primaries = FE_BT2020; break;
     case PL_COLOR_PRIM_BT_709: colour->primaries = FE_BT709_PRIMARIES; break;
@@ -443,13 +507,14 @@ static bool source_colour(struct priv *p, struct mp_image *image, fe_colour *col
     return true;
 }
 
-static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *frame)
+bool mp_hdr_frame_descriptor(struct mp_image *image, fe_frame *frame,
+                            double reference_white, double hlg_peak,
+                            char *error, size_t capacity)
 {
-    struct priv *p = f->priv;
     CVPixelBufferRef buffer = (CVPixelBufferRef)image->planes[3];
     if (image->imgfmt != IMGFMT_VIDEOTOOLBOX || !buffer || image->source_pts == AV_NOPTS_VALUE ||
         image->source_timebase_num <= 0 || image->source_timebase_den <= 0) {
-        MP_ERR(f, "Missing hardware buffer or rational decoder timing: format=%s pts=%lld timebase=%d/%d\n",
+        snprintf(error, capacity, "Missing hardware buffer or rational decoder timing: format=%s pts=%lld timebase=%d/%d",
             mp_imgfmt_to_name(image->imgfmt), (long long)image->source_pts,
             image->source_timebase_num, image->source_timebase_den);
         return false;
@@ -458,7 +523,7 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
     double exact_pts = image->source_pts * av_q2d(timebase);
     // Filters that changed timeline semantics must provide a new rational identity.
     if (fabs(exact_pts - image->pts) > 1e-9) {
-        MP_ERR(f, "Decoder/source timeline differs: rational=%.12f playback=%.12f\n", exact_pts, image->pts);
+        snprintf(error, capacity, "Decoder/source timeline differs: rational=%.12f playback=%.12f", exact_pts, image->pts);
         return false;
     }
     int64_t pts;
@@ -482,8 +547,8 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
         frame_duration = (fe_time){duration.num, duration.den};
     }
     *frame = (fe_frame){ .struct_size = sizeof(*frame), .abi_version = FE_ABI_VERSION,
-        .source_id = 1, .stream_id = 1, .frame_id = p->next_frame,
-        .generation = fe_session_generation(p->session), .pts = {pts, timebase.den},
+        .source_id = 1, .stream_id = 1, .frame_id = 0,
+        .generation = 1, .pts = {pts, timebase.den},
         .duration = frame_duration, .pixel_buffer = buffer,
         .pixel_format = CVPixelBufferGetPixelFormatType(buffer),
         .plane_count = (uint32_t)CVPixelBufferGetPlaneCount(buffer),
@@ -494,8 +559,8 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
             .pixel_aspect_num = image->params.p_w > 0 ? image->params.p_w : 1,
             .pixel_aspect_den = image->params.p_h > 0 ? image->params.p_h : 1 },
     };
-    if (!source_colour(p, image, &frame->colour) || frame->plane_count > 3) {
-        MP_ERR(f, "Unsupported source interpretation: %s chroma=%d planes=%u\n",
+    if (!source_colour(image, &frame->colour, reference_white, hlg_peak) || frame->plane_count > 3) {
+        snprintf(error, capacity, "Unsupported source interpretation: %s chroma=%d planes=%u",
                mp_image_params_to_str(&image->params), image->params.chroma_location, frame->plane_count);
         return false;
     }
@@ -504,6 +569,20 @@ static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *fr
             .height = CVPixelBufferGetHeightOfPlane(buffer, n),
             .bytes_per_row = CVPixelBufferGetBytesPerRowOfPlane(buffer, n) };
     }
+    return true;
+}
+
+static bool descriptor(struct mp_filter *f, struct mp_image *image, fe_frame *frame)
+{
+    struct priv *p = f->priv;
+    char error[512] = "Unrepresentable source timestamp or duration";
+    if (!mp_hdr_frame_descriptor(image, frame, p->opts->reference_white,
+                                 p->opts->hlg_peak, error, sizeof(error))) {
+        MP_ERR(f, "%s\n", error);
+        return false;
+    }
+    frame->frame_id = p->next_frame;
+    frame->generation = fe_session_generation(p->session);
     return true;
 }
 
@@ -551,6 +630,7 @@ static bool configure_measurements(struct mp_filter *f, struct mp_image *image)
 static void process(struct mp_filter *f)
 {
     struct priv *p = f->priv;
+    if (p->interpretation_rejected) return;
     refresh_prepared(p);
     bool needs_output = mp_pin_in_needs_data(f->ppins[1]);
     mp_mutex_lock(&p->lock);
@@ -673,7 +753,22 @@ static void process(struct mp_filter *f)
         return;
     }
     struct mp_image *image = p->held_input.data;
-    if (p->opts->bypass) {
+    if (p->state) {
+        p->state->source_fps = image->nominal_fps;
+        p->state->source_width = image->w;
+        p->state->source_height = image->h;
+    }
+    int dovi_path = native_dovi_path(f, image);
+    if (dovi_path < 0) {
+        // A failed user filter is automatically removed by mpv, which would
+        // present these same uninterpretable code values. End video instead.
+        // The diagnostic/capability reason remains available to the host.
+        mp_frame_unref(&p->held_input);
+        p->interpretation_rejected = true;
+        mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
+        return;
+    }
+    if (p->opts->bypass || dovi_path > 0) {
         mp_pin_in_write(f->ppins[1], p->held_input);
         p->held_input = MP_NO_FRAME;
         return;
@@ -694,11 +789,6 @@ static void process(struct mp_filter *f)
     }
     p->input_params = image->params;
     p->have_input_params = true;
-    if (p->state) {
-        p->state->source_fps = image->nominal_fps;
-        p->state->source_width = image->w;
-        p->state->source_height = image->h;
-    }
     fe_frame frame;
     if (!descriptor(f, image, &frame) || !configure_measurements(f, image)) {
         MP_ERR(f, "metal-hdr requires VideoToolbox NV12/P010 input, supported colour metadata and unmodified rational decoder PTS\n");
@@ -752,7 +842,7 @@ static bool command(struct mp_filter *f, struct mp_filter_command *command)
     if (command->type != MP_FILTER_COMMAND_TEXT)
         return false;
     if (!strcmp(command->cmd, "prepare")) {
-        if (!p->prepared) return false;
+        if (!p->prepared || p->dovi_detected) return false;
         if (!strcmp(command->arg, "start")) {
             if (fe_prepared_start(p->prepared) != FE_ACCEPTED) return false;
         } else if (!strcmp(command->arg, "cancel")) {
@@ -913,8 +1003,12 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         NSData *data = [NSData dataWithContentsOfFile:[NSString stringWithUTF8String:p->opts->prepared_config]];
         if (!data || data.length > 65536) { MP_ERR(f, "Cannot read bounded Prepared configuration\n"); goto error; }
         NSString *json = [[[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] autorelease];
-        p->prepared = fe_prepared_create(&config, json.UTF8String, path.UTF8String,
-                                         p->error, sizeof(p->error));
+        fe_preparation_decoder_provider decoder = mp_hdr_preparation_decoder(f,
+            p->opts->reference_white, p->opts->hlg_peak);
+        if (!decoder.user) { MP_ERR(f, "Prepared decoder requires the opened source demuxer\n"); goto error; }
+        p->prepared = fe_prepared_create_with_decoder(&config, json.UTF8String,
+            path.UTF8String, &decoder, p->error, sizeof(p->error));
+        decoder.release_user(decoder.user);
         if (!p->prepared) { MP_ERR(f, "%s\n", p->error); goto error; }
         p->session = fe_prepared_session_create(p->prepared, p->error, sizeof(p->error));
         if (p->opts->prepare) fe_prepared_start(p->prepared);

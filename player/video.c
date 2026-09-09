@@ -268,6 +268,11 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
     vo_c->filter->update_subtitles = filter_update_subtitles;
     vo_c->filter->update_subtitles_ctx = mpctx;
     int video_ordinal = -1;
+    const struct mp_codec_params *dovi_codec = track && track->stream ? track->stream->codec : NULL;
+    mp_output_chain_set_dovi(vo_c->filter,
+        dovi_codec && dovi_codec->dovi ? dovi_codec->dv_profile : 0,
+        dovi_codec ? dovi_codec->dv_level : 0,
+        dovi_codec ? dovi_codec->dv_bl_compatibility_id : 0);
     if (track && track->demuxer && track->stream) {
         int index = 0;
         for (int n = 0; n < demux_get_num_stream(track->demuxer); n++) {
@@ -276,7 +281,9 @@ void reinit_video_chain_src(struct MPContext *mpctx, struct track *track)
             if (stream == track->stream) { video_ordinal = index; break; }
             index++;
         }
-        mp_output_chain_set_source(vo_c->filter, track->demuxer->filename, video_ordinal);
+        mp_output_chain_set_source(vo_c->filter, track->demuxer->filename,
+            video_ordinal, track->demuxer->desc->name,
+            mpctx->opts->rebase_start_time ? -track->demuxer->start_time : 0);
     }
 
     if (track) {
@@ -1111,7 +1118,7 @@ void write_video(struct MPContext *mpctx)
     // enhanced result is ready. User pause remains a separate state.
     bool preview_wait = async->active && async->waiting_preview && vo_has_frame(vo);
     bool keep_buffering = preview_wait ||
-        (async->adaptive && mpctx->paused_for_enhancement && !mpctx->num_next_frames);
+        (async->adaptive && mpctx->paused_for_enhancement);
     if ((!async->active || !keep_buffering) && mpctx->paused_for_enhancement) {
         mpctx->paused_for_enhancement = false;
         mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
@@ -1167,9 +1174,13 @@ void write_video(struct MPContext *mpctx)
                 mpctx->paused_for_enhancement = true;
                 mpctx->enhancement_buffer_start = mp_time_sec();
                 mpctx->enhancement_buffer_count++;
+                double audio_before_pause = playing_audio_pts(mpctx);
                 update_internal_pause_state(mpctx);
                 mp_client_property_change(mpctx, "enhancement-state");
-                MP_VERBOSE(mpctx, "Adaptive enhancement buffer: both playback clocks paused\n");
+                MP_VERBOSE(mpctx, "Adaptive enhancement buffer: both playback clocks paused; "
+                    "video=%.9f audio-before=%.9f audio-after=%.9f transition=%.9f\n",
+                    mpctx->video_pts, audio_before_pause, playing_audio_pts(mpctx),
+                    mp_time_sec() - mpctx->enhancement_buffer_start);
             }
         }
         // Heuristic to detect underruns.
@@ -1248,13 +1259,6 @@ void write_video(struct MPContext *mpctx)
         mp_wakeup_core(mpctx); // Decode more in next iteration.
         return;
     }
-    if (mpctx->paused_for_enhancement) {
-        mpctx->paused_for_enhancement = false;
-        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
-        update_internal_pause_state(mpctx);
-        mp_client_property_change(mpctx, "enhancement-state");
-    }
-
     // A sparse still-image stream may have no frame at the seek target.
     // Complete the restart without showing it.
     if (vo_c->is_sparse && mpctx->video_status < STATUS_READY) {
@@ -1322,6 +1326,30 @@ void write_video(struct MPContext *mpctx)
         mp_mutex_unlock(&vo->params_mutex);
     }
 
+    // A completed enhancement may still need a VO reconfiguration or subtitle
+    // packets. Keep the shared clock held until those dependencies and the VO
+    // queue are ready; resuming at VD_NEW_FRAME would let audio advance across
+    // the early returns above and below without a replacement video frame.
+    osd_set_force_video_pts(mpctx->osd, MP_NOPTS_VALUE);
+    if (!update_subtitles(mpctx, mpctx->next_frames[0]->pts)) {
+        MP_VERBOSE(mpctx, "Video frame delayed due to waiting on subtitles.\n");
+        return;
+    }
+    if (mpctx->paused_for_enhancement) {
+        if (!vo_is_ready_for_frame(vo, -1))
+            return;
+        double resume_start = mp_time_sec();
+        double audio_before_resume = playing_audio_pts(mpctx);
+        mpctx->paused_for_enhancement = false;
+        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+        update_internal_pause_state(mpctx);
+        mp_client_property_change(mpctx, "enhancement-state");
+        MP_VERBOSE(mpctx, "Adaptive enhancement ready: video=%.9f next=%.9f "
+            "audio-before=%.9f audio-after=%.9f transition=%.9f\n",
+            mpctx->video_pts, mpctx->next_frames[0]->pts,
+            audio_before_resume, playing_audio_pts(mpctx), mp_time_sec() - resume_start);
+    }
+
     mpctx->time_frame -= get_relative_time(mpctx);
     update_avsync_before_frame(mpctx);
 
@@ -1334,14 +1362,6 @@ void write_video(struct MPContext *mpctx)
         double fpts = mpctx->next_frames[0]->pts;
         if (apts != MP_NOPTS_VALUE && fpts != MP_NOPTS_VALUE)
             mpctx->time_frame = MPMAX(fpts - apts, 0) / mpctx->video_speed;
-    }
-
-    // Enforce timing subtitles to video frames.
-    osd_set_force_video_pts(mpctx->osd, MP_NOPTS_VALUE);
-
-    if (!update_subtitles(mpctx, mpctx->next_frames[0]->pts)) {
-        MP_VERBOSE(mpctx, "Video frame delayed due to waiting on subtitles.\n");
-        return;
     }
 
     double time_frame = MPMAX(mpctx->time_frame, -1);
@@ -1398,6 +1418,13 @@ void write_video(struct MPContext *mpctx)
     shift_frames(mpctx);
 
     schedule_frame(mpctx, frame);
+
+    if (async->active && fabs(mpctx->last_av_difference) > .020) {
+        MP_VERBOSE(mpctx, "Enhancement clock offset: video=%.9f audio=%.9f "
+            "avsync=%.9f time-frame=%.9f frame-duration=%.9f\n",
+            mpctx->video_pts, playing_audio_pts(mpctx), mpctx->last_av_difference,
+            mpctx->time_frame, MP_TIME_NS_TO_S(frame->duration));
+    }
 
     mpctx->osd_force_update = true;
     update_osd_msg(mpctx);

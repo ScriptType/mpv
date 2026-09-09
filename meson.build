@@ -1575,7 +1575,7 @@ frame_engine = dependency('frame-engine', required: get_option('frame-engine').r
 features += {'frame-engine': frame_engine.found()}
 if features['frame-engine']
     dependencies += frame_engine
-    sources += files('video/filter/vf_metal_hdr.m')
+    sources += files('video/filter/vf_metal_hdr.m', 'video/filter/metal_hdr_decoder.m')
 endif
 
 
