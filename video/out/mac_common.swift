@@ -43,7 +43,9 @@ class MacCommon: Common {
     @objc func config(_ vo: UnsafeMutablePointer<vo>) -> Bool {
         eventsLock.withLock { self.vo = vo }
 
+        var configured = false
         DispatchQueue.main.sync {
+            guard prepareEmbeddedHost() else { return }
             let previousActiveApp = getActiveApp()
             initApp()
 
@@ -53,7 +55,7 @@ class MacCommon: Common {
                 exit(1)
             }
 
-            if window == nil {
+            if view == nil {
                 initView(vo, layer)
                 initWindow(vo, previousActiveApp)
                 initWindowState()
@@ -65,15 +67,16 @@ class MacCommon: Common {
                 window?.updateSize(wr.size)
             }
 
-            if option.vo.focus_on == 2 {
+            if embeddedHost == nil && option.vo.focus_on == 2 {
                 NSApp.activate(ignoringOtherApps: true)
             }
 
             windowDidResize()
             updateICCProfile()
+            configured = true
         }
 
-        return true
+        return configured
     }
 
     @objc func uninit(_ vo: UnsafeMutablePointer<vo>) {
@@ -109,8 +112,13 @@ class MacCommon: Common {
         info.pointee.last_queue_display_time = next?.time ?? -1
     }
 
+    @objc var surfaceSize: CGSize {
+        let measure = { self.view.map { $0.convertToBacking($0.bounds).size } ?? .zero }
+        return Thread.isMainThread ? measure() : DispatchQueue.main.sync(execute: measure)
+    }
+
     @objc func isVisible() -> Bool {
-        return window?.occlusionState.contains(.visible) ?? false ||
+        return presentationWindow?.occlusionState.contains(.visible) ?? false ||
                option.vo.force_render ||
                needsInitialDraw
     }
@@ -175,7 +183,7 @@ class MacCommon: Common {
     }
 
     override func windowDidChangeBackingProperties() {
-        layer?.contentsScale = window?.backingScaleFactor ?? 1
+        layer?.contentsScale = presentationWindow?.backingScaleFactor ?? 1
         windowDidResize()
     }
 

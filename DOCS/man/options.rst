@@ -3843,6 +3843,16 @@ Window
     specially, and mpv will draw on top of the desktop wallpaper and below
     desktop icons.
 
+    On macOS with ``--gpu-context=macvk``, libmpv interprets the ID as an
+    in-process ``NSView *`` cast to ``intptr_t``. The view must belong to the
+    embedding application's AppKit main thread. mpv retains the host view,
+    attaches a Metal-backed child covering its bounds, and removes that child
+    during VO teardown. The embedding application keeps ownership of the
+    window, window delegate, fullscreen state and controls. Resize, backing-scale
+    and display changes are observed without creating or closing a host window.
+    This is a libmpv embedding interface; a pointer from a different process is
+    not a valid ID. The value ``0`` is unsupported on macOS.
+
     On Android, the ID is interpreted as ``android.view.Surface``. Pass it as a
     value cast to ``intptr_t``. Use with ``--vo=mediacodec_embed`` and
     ``--hwdec=mediacodec`` for direct rendering using MediaCodec, or with

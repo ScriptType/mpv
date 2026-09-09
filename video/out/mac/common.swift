@@ -28,6 +28,14 @@ class Common: NSObject {
     var view: View?
     var titleBar: TitleBar?
 
+    // --wid in a libmpv host is an in-process NSView pointer. Retain it for the
+    // entire VO lifetime, but never take ownership of its window/delegate.
+    var embeddedHost: NSView?
+    var presentationWindow: NSWindow? { return embeddedHost?.window ?? window }
+    var embeddedObservers: [NSObjectProtocol] = []
+    var isUninitializing = false
+    var hostNotificationState: (frame: Bool, bounds: Bool)?
+
     var link: CVDisplayLink?
 
     let eventsLock = NSLock()
@@ -63,6 +71,7 @@ class Common: NSObject {
     }
 
     func initApp() {
+        if option.vo.WinID >= 0 { return }
         var policy: NSApplication.ActivationPolicy = .regular
         switch option.mac.macos_app_activation_policy {
         case 0: policy = .regular
@@ -81,6 +90,15 @@ class Common: NSObject {
         guard let view = self.view else {
             log.error("Something went wrong, no View was initialized")
             exit(1)
+        }
+
+        if let host = embeddedHost {
+            view.frame = host.bounds
+            host.addSubview(view)
+            view.layer?.contentsScale = host.window?.backingScaleFactor ?? 1
+            observeEmbeddedHost()
+            flagEvents(VO_EVENT_RESIZE | VO_EVENT_EXPOSE | VO_EVENT_WIN_STATE)
+            return
         }
 
         window = Window(contentRect: wr, screen: targetScreen, view: view, common: self)
@@ -136,6 +154,7 @@ class Common: NSObject {
     }
 
     func initWindowState() {
+        if embeddedHost != nil { return }
         if option.vo.fullscreen {
             DispatchQueue.main.async {
                 self.window?.toggleFullScreen(nil)
@@ -144,6 +163,7 @@ class Common: NSObject {
     }
 
     func uninitCommon() {
+        isUninitializing = true
         eventsLock.withLock { self.vo = nil }
         setCursorVisibility(true)
         stopDisplaylink()
@@ -154,7 +174,67 @@ class Common: NSObject {
         window?.orderOut(nil)
 
         titleBar?.removeFromSuperview()
+        embeddedObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        embeddedObservers.removeAll()
         view?.removeFromSuperview()
+        if let host = embeddedHost, let state = hostNotificationState {
+            host.postsFrameChangedNotifications = state.frame
+            host.postsBoundsChangedNotifications = state.bounds
+        }
+        embeddedHost = nil
+    }
+
+    // Call only on AppKit's main thread, before constructing the child view.
+    func prepareEmbeddedHost() -> Bool {
+        if option.vo.WinID < 0 { return true }
+        if embeddedHost != nil { return true }
+        guard option.vo.WinID > 0, let pointer = UnsafeRawPointer(bitPattern: Int(option.vo.WinID)) else {
+            log.error("macvk --wid requires a retained in-process NSView pointer")
+            return false
+        }
+        embeddedHost = Unmanaged<NSView>.fromOpaque(pointer).takeUnretainedValue()
+        return true
+    }
+
+    func observeEmbeddedHost() {
+        embeddedObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        embeddedObservers.removeAll()
+        guard let host = embeddedHost else { return }
+        if hostNotificationState == nil {
+            hostNotificationState = (host.postsFrameChangedNotifications, host.postsBoundsChangedNotifications)
+        }
+        host.postsFrameChangedNotifications = true
+        host.postsBoundsChangedNotifications = true
+        let center = NotificationCenter.default
+        for name in [NSView.frameDidChangeNotification, NSView.boundsDidChangeNotification] {
+            embeddedObservers.append(center.addObserver(forName: name, object: host, queue: .main) { [weak self] _ in
+                guard let self = self, let host = self.embeddedHost else { return }
+                self.view?.frame = host.bounds
+                self.windowDidChangeBackingProperties()
+            })
+        }
+        guard let hostWindow = host.window else { return }
+        for name in [NSWindow.didChangeScreenNotification, NSWindow.didChangeScreenProfileNotification,
+                     NSWindow.didChangeBackingPropertiesNotification, NSWindow.didResizeNotification,
+                     NSWindow.didChangeOcclusionStateNotification, NSWindow.didBecomeKeyNotification,
+                     NSWindow.didResignKeyNotification, NSWindow.didEnterFullScreenNotification,
+                     NSWindow.didExitFullScreenNotification, NSWindow.didDeminiaturizeNotification] {
+            embeddedObservers.append(center.addObserver(forName: name, object: hostWindow, queue: .main) { [weak self] _ in
+                guard let self = self else { return }
+                self.updateDisplaylink()
+                self.windowDidChangeBackingProperties()
+                self.windowDidChangeScreenProfile()
+                self.flagEvents(VO_EVENT_RESIZE | VO_EVENT_EXPOSE | VO_EVENT_WIN_STATE | VO_EVENT_FOCUS)
+            })
+        }
+        updateDisplaylink()
+    }
+
+    func embeddedViewDidMoveToWindow() {
+        if embeddedHost == nil || isUninitializing { return }
+        observeEmbeddedHost()
+        windowDidChangeBackingProperties()
+        windowDidChangeScreenProfile()
     }
 
     func displayLinkCallback(_ displayLink: CVDisplayLink,
@@ -188,7 +268,7 @@ class Common: NSObject {
     }
 
     func updateDisplaylink() {
-        guard let screen = window?.screen, let link = self.link else {
+        guard let screen = presentationWindow?.screen, let link = self.link else {
             log.warning("Couldn't update DisplayLink, no Screen or DisplayLink available")
             return
         }
@@ -313,7 +393,7 @@ class Common: NSObject {
     var reconfigureCallback: CGDisplayReconfigurationCallBack = { (display, flags, userInfo) in
         if flags.contains(.setModeFlag) {
             let com = unsafeBitCast(userInfo, to: Common.self)
-            let displayID = com.window?.screen?.displayID ?? display
+            let displayID = com.presentationWindow?.screen?.displayID ?? display
 
             if displayID == display {
                 com.log.verbose("Detected display mode change, updating screen refresh rate")
@@ -404,9 +484,7 @@ class Common: NSObject {
     }
 
     func getCurrentScreen() -> NSScreen? {
-         return window != nil ? window?.screen :
-                                    getTargetScreen(forFullscreen: false) ??
-                                    NSScreen.main
+         return presentationWindow?.screen ?? getTargetScreen(forFullscreen: false) ?? NSScreen.main
     }
 
     func getWindowGeometry(forScreen screen: NSScreen,
@@ -441,6 +519,9 @@ class Common: NSObject {
     }
 
     func getInitProperties(_ vo: UnsafeMutablePointer<vo>) -> (NSScreen, NSRect, Bool) {
+        if let host = embeddedHost, let screen = host.window?.screen ?? NSScreen.main {
+            return (screen, host.bounds, false)
+        }
         guard let targetScreen = getTargetScreen(forFullscreen: false) ?? NSScreen.main else {
             log.error("Something went wrong, no Screen was found")
             exit(1)
@@ -555,6 +636,10 @@ class Common: NSObject {
             fps.pointee = currentFps()
             return VO_TRUE
         case VOCTRL_GET_WINDOW_ID:
+            if let host = embeddedHost {
+                data!.assumingMemoryBound(to: Int64.self).pointee = Int64(Int(bitPattern: Unmanaged.passUnretained(host).toOpaque()))
+                return VO_TRUE
+            }
             guard let window = window else {
                 return VO_NOTAVAIL
             }
@@ -564,7 +649,7 @@ class Common: NSObject {
         case VOCTRL_GET_HIDPI_SCALE:
             let scaleFactor = data!.assumingMemoryBound(to: CDouble.self)
             let screen = getCurrentScreen()
-            let factor = window?.backingScaleFactor ??
+            let factor = presentationWindow?.backingScaleFactor ??
                          screen?.backingScaleFactor ?? 1.0
             scaleFactor.pointee = Double(factor)
             return VO_TRUE
@@ -603,6 +688,7 @@ class Common: NSObject {
             }
             return VO_NOTIMPL
         case VOCTRL_GET_UNFS_WINDOW_SIZE:
+            if embeddedHost != nil { return VO_NOTIMPL }
             let sizeData = data!.assumingMemoryBound(to: Int32.self)
             let size = UnsafeMutableBufferPointer(start: sizeData, count: 2)
             let rect = (Bool(option.vo.hidpi_window_scale) ? window?.unfsContentFrame
@@ -612,6 +698,7 @@ class Common: NSObject {
             size[1] = Int32(rect.size.height)
             return VO_TRUE
         case VOCTRL_SET_UNFS_WINDOW_SIZE:
+            if embeddedHost != nil { return VO_NOTIMPL }
             let sizeData = data!.assumingMemoryBound(to: Int32.self)
             let size = UnsafeBufferPointer(start: sizeData, count: 2)
             var rect = NSRect(x: 0, y: 0, width: CGFloat(size[0]), height: CGFloat(size[1]))
@@ -645,7 +732,7 @@ class Common: NSObject {
             return VO_TRUE
         case VOCTRL_GET_FOCUSED:
             let focus = data!.assumingMemoryBound(to: CBool.self)
-            focus.pointee = NSApp.isActive
+            focus.pointee = NSApp.isActive && (presentationWindow?.isKeyWindow ?? true)
             return VO_TRUE
         case VOCTRL_UPDATE_WINDOW_TITLE:
             let title = String(cString: data!.assumingMemoryBound(to: CChar.self))

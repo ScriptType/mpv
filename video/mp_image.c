@@ -17,6 +17,7 @@
 
 #include <limits.h>
 #include <assert.h>
+#include <stdatomic.h>
 
 #include <libavutil/mem.h>
 #include <libavutil/common.h>
@@ -234,6 +235,7 @@ static void mp_image_destructor(void *ptr)
     av_buffer_unref(&mpi->a53_cc);
     av_buffer_unref(&mpi->dovi);
     av_buffer_unref(&mpi->film_grain);
+    av_buffer_unref(&mpi->async_generation);
     for (int n = 0; n < mpi->num_ff_side_data; n++)
         av_buffer_unref(&mpi->ff_side_data[n].buf);
     talloc_free(mpi->ff_side_data);
@@ -347,6 +349,12 @@ static void ref_buffer(AVBufferRef **dst)
     }
 }
 
+bool mp_image_is_current(struct mp_image *img)
+{
+    return !img || !img->async_generation ||
+        atomic_load((_Atomic uint64_t *)img->async_generation->data) == img->async_frame_generation;
+}
+
 // Return a new reference to img. The returned reference is owned by the caller,
 // while img is left untouched.
 struct mp_image *mp_image_new_ref(struct mp_image *img)
@@ -369,6 +377,7 @@ struct mp_image *mp_image_new_ref(struct mp_image *img)
     ref_buffer(&new->a53_cc);
     ref_buffer(&new->dovi);
     ref_buffer(&new->film_grain);
+    ref_buffer(&new->async_generation);
 
     new->ff_side_data = talloc_memdup(NULL, new->ff_side_data,
                         new->num_ff_side_data * sizeof(new->ff_side_data[0]));
@@ -409,6 +418,7 @@ struct mp_image *mp_image_new_dummy_ref(struct mp_image *img)
     new->a53_cc = NULL;
     new->dovi = NULL;
     new->film_grain = NULL;
+    new->async_generation = NULL;
     new->num_ff_side_data = 0;
     new->ff_side_data = NULL;
     new->enhancement_layer = NULL;
@@ -547,6 +557,12 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->pts = src->pts;
     dst->dts = src->dts;
     dst->pkt_duration = src->pkt_duration;
+    dst->source_pts = src->source_pts;
+    dst->source_duration = src->source_duration;
+    dst->source_timebase_num = src->source_timebase_num;
+    dst->source_timebase_den = src->source_timebase_den;
+    assign_bufref(&dst->async_generation, src->async_generation);
+    dst->async_frame_generation = src->async_frame_generation;
     dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;

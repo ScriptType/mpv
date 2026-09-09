@@ -1570,6 +1570,14 @@ if features['videotoolbox-pl']
     sources += files('video/out/hwdec/hwdec_vt_pl.m')
 endif
 
+frame_engine = dependency('frame-engine', required: get_option('frame-engine').require(
+    features['videotoolbox-pl'], error_message: 'frame-engine requires VideoToolbox/libplacebo'))
+features += {'frame-engine': frame_engine.found()}
+if features['frame-engine']
+    dependencies += frame_engine
+    sources += files('video/filter/vf_metal_hdr.m')
+endif
+
 
 # macOS features
 macos_sdk_version_py = ''

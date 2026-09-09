@@ -76,7 +76,9 @@ static int mapper_init(struct ra_hwdec_mapper *mapper)
     }
 
     for (int n = 0; n < p->desc.num_planes; n++) {
-        if (!p->desc.planes[n] || p->desc.planes[n]->ctype != RA_CTYPE_UNORM) {
+        if (!p->desc.planes[n] ||
+            (p->desc.planes[n]->ctype != RA_CTYPE_UNORM &&
+             p->desc.planes[n]->ctype != RA_CTYPE_FLOAT)) {
             MP_ERR(mapper, "Format unsupported.\n");
             return -1;
         }
@@ -235,8 +237,10 @@ static int mapper_map(struct ra_hwdec_mapper *mapper)
             return -1;
         }
 
-        size_t width  = CVPixelBufferGetWidthOfPlane(p->pbuf, i),
-               height = CVPixelBufferGetHeightOfPlane(p->pbuf, i);
+        size_t width = planar ? CVPixelBufferGetWidthOfPlane(p->pbuf, i)
+                              : CVPixelBufferGetWidth(p->pbuf);
+        size_t height = planar ? CVPixelBufferGetHeightOfPlane(p->pbuf, i)
+                               : CVPixelBufferGetHeight(p->pbuf);
 
         CVReturn err = CVMetalTextureCacheCreateTextureFromImage(
             kCFAllocatorDefault,

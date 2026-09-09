@@ -82,6 +82,9 @@ const struct m_obj_list af_obj_list = {
 // --vf option
 
 const struct mp_user_filter_entry *vf_list[] = {
+#if HAVE_FRAME_ENGINE
+    &vf_metal_hdr,
+#endif
     &vf_format,
     &vf_lavfi,
     &vf_lavfi_bridge,

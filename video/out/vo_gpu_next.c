@@ -1341,6 +1341,10 @@ static void update_hook_opts_dynamic(struct priv *p, const struct pl_hook *hook,
 static bool draw_frame(struct vo *vo, struct vo_frame *frame)
 {
     struct priv *p = vo->priv;
+    if (!mp_image_is_current(frame->current)) {
+        p->want_reset = true;
+        return false;
+    }
     pl_options pars = p->pars;
     pl_gpu gpu = p->gpu;
     update_options(vo);
@@ -1737,6 +1741,15 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
         // Update dynamic hook parameters
         for (int i = 0; i < pars->params.num_hooks; i++)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
+    }
+
+    // A seek may cancel a generation while this renderer prepares its passes.
+    // Check every contributing image again immediately before GPU submission.
+    for (int i = 0; i < mix.num_frames; i++) {
+        if (!mp_image_is_current(mix.frames[i]->user_data)) {
+            p->want_reset = true;
+            goto done;
+        }
     }
 
     // Render frame

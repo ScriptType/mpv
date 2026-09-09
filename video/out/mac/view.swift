@@ -49,6 +49,11 @@ class View: NSView, CALayerDelegate {
         fatalError("init(coder:) has not been implemented")
     }
 
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        common.embeddedViewDidMoveToWindow()
+    }
+
     override func updateTrackingAreas() {
         if let tracker = self.tracker {
             removeTrackingArea(tracker)
@@ -185,6 +190,10 @@ class View: NSView, CALayerDelegate {
     }
 
     func containsMouseLocation() -> Bool {
+        if common.embeddedHost != nil {
+            guard let window = window else { return false }
+            return bounds.contains(convert(window.mouseLocationOutsideOfEventStream, from: nil))
+        }
         var topMargin: CGFloat = 0.0
         let menuBarHeight = NSApp.mainMenu?.menuBarHeight ?? 23.0
 
@@ -210,7 +219,7 @@ class View: NSView, CALayerDelegate {
     }
 
     func canHideCursor() -> Bool {
-        guard let window = common.window else { return false }
+        guard let window = common.presentationWindow else { return false }
         return !hasMouseDown && containsMouseLocation() && window.isKeyWindow
     }
 }

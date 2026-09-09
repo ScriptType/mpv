@@ -104,6 +104,13 @@ typedef struct mp_image {
     double pts;
     /* only after decoder */
     double dts, pkt_duration;
+    /* Exact decoder timing for asynchronous adapters; den == 0 means unavailable.
+     * Only valid while pts/pkt_duration still equal their rational conversion. */
+    int64_t source_pts, source_duration;
+    int source_timebase_num, source_timebase_den;
+    /* Optional reference-counted atomic generation for late presentation checks. */
+    struct AVBufferRef *async_generation;
+    uint64_t async_frame_generation;
     /* container reported FPS; can be incorrect, or 0 if unknown */
     double nominal_fps;
     /* for private use */
@@ -152,6 +159,7 @@ void mp_image_copy_attributes(struct mp_image *dmpi, struct mp_image *mpi);
 struct mp_image *mp_image_new_copy(struct mp_image *img);
 struct mp_image *mp_image_new_ref(struct mp_image *img);
 bool mp_image_is_writeable(struct mp_image *img);
+bool mp_image_is_current(struct mp_image *img);
 bool mp_image_make_writeable(struct mp_image *img);
 void mp_image_setrefp(struct mp_image **p_img, struct mp_image *new_value);
 void mp_image_unrefp(struct mp_image **p_img);

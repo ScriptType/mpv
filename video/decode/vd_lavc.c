@@ -1329,6 +1329,10 @@ static int decode_frame(struct mp_filter *vd)
     ctx->hwdec_fail_count = 0;
 
     mpi->pts = mp_pts_from_av(ctx->pic->pts, &ctx->codec_timebase);
+    mpi->source_pts = ctx->pic->pts;
+    mpi->source_duration = ctx->pic->duration;
+    mpi->source_timebase_num = ctx->codec_timebase.num;
+    mpi->source_timebase_den = ctx->codec_timebase.den;
     mpi->dts = mp_pts_from_av(ctx->pic->pkt_dts, &ctx->codec_timebase);
     mpi->pkt_duration = mp_pts_from_av(ctx->pic->duration, &ctx->codec_timebase);
 

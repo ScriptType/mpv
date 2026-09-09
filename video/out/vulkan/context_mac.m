@@ -114,10 +114,9 @@ static bool resize(struct ra_ctx *ctx)
 {
     struct priv *p = ctx->priv;
 
-    if (!p->vo_mac.window) {
-        return false;
-    }
-    CGSize size = p->vo_mac.window.framePixel.size;
+    CGSize size = p->vo_mac.surfaceSize;
+    if (size.width < 1 || size.height < 1)
+        return true; // A hidden/temporarily detached host retains its last swapchain.
 
     return ra_vk_ctx_resize(ctx, (int)size.width, (int)size.height);
 }
