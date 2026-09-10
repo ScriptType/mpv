@@ -1756,13 +1756,18 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     node_map_add_flag(r, "compare-ready", current && current->async_pair &&
                       mp_image_is_current(current) && mpctx->opts->pause);
     node_map_add_string(r, "comparison", current && current->async_original ? "original" : "enhanced");
+    // Original/Dolby Vision output also carries decoder-native rational timing.
+    // An enhancement generation is independent of source timestamp validity.
+    if (current && current->source_pts != AV_NOPTS_VALUE &&
+        current->source_timebase_num > 0 && current->source_timebase_den > 0) {
+        node_map_add_int64(r, "displayed-source-pts", current->source_pts);
+        node_map_add_int64(r, "displayed-timebase-num", current->source_timebase_num);
+        node_map_add_int64(r, "displayed-timebase-den", current->source_timebase_den);
+    }
     if (current && current->async_generation) {
         const char *kinds[] = {"unknown", "original", "enhanced", "prepared-original", "prepared-enhanced"};
         int kind = current->async_content_kind;
         node_map_add_string(r, "displayed-content-kind", kind >= 0 && kind < MP_ARRAY_SIZE(kinds) ? kinds[kind] : "unknown");
-        node_map_add_int64(r, "displayed-source-pts", current->source_pts);
-        node_map_add_int64(r, "displayed-timebase-num", current->source_timebase_num);
-        node_map_add_int64(r, "displayed-timebase-den", current->source_timebase_den);
         node_map_add_int64(r, "displayed-generation", current->async_frame_generation);
     }
     talloc_free(current);

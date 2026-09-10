@@ -555,6 +555,7 @@ static void unregister_hotplug_cb(struct ao *ao)
 const struct ao_driver audio_out_coreaudio = {
     .description    = "CoreAudio AudioUnit",
     .name           = "coreaudio",
+    .has_pause_clock_tail = true,
     .uninit         = uninit,
     .init           = init,
     .control        = control,

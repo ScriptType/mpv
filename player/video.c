@@ -1162,7 +1162,28 @@ void write_video(struct MPContext *mpctx)
     if (r == VD_WAIT) {
         if ((async->adaptive || async->live) && mpctx->video_status == STATUS_PLAYING &&
             !mpctx->paused_for_enhancement) {
-            if (vo_still_displaying(vo)) {
+            bool wait_for_video = vo_still_displaying(vo);
+            if (async->adaptive && wait_for_video && mpctx->ao && mpctx->audio_status == STATUS_PLAYING &&
+                !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
+                // The measured CoreAudio pull clock can keep advancing after a
+                // reset-based pause. Account for that tail before the current
+                // video deadline. Unqualified AOs retain the ordinary deadline.
+                // Use the core timer as well as the potentially late VO wakeup.
+                int64_t frame_end = vo_get_last_frame_end(vo);
+                double tail = ao_get_pause_clock_tail(mpctx->ao);
+                if (frame_end > 0 && isfinite(tail) && tail >= 0) {
+                    double lead = tail + .002;
+                    double remaining = MP_TIME_NS_TO_S(frame_end - mp_time_ns()) - lead;
+                    // An unavailable estimate retains the ordinary VO deadline.
+                    if (isfinite(remaining)) {
+                        if (remaining > 0)
+                            mp_set_timeout(mpctx, remaining);
+                        else
+                            wait_for_video = false;
+                    }
+                }
+            }
+            if (wait_for_video) {
                 vo_request_wakeup_on_done(vo);
             } else {
                 if (async->live) {

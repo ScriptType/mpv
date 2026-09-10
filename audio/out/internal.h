@@ -137,6 +137,9 @@ struct ao_driver {
     // If true, write units of entire frames. The write() call is modified to
     // use data==mp_aframe. Useful for encoding AO only.
     bool write_frames;
+    // Opt in only after measuring a pull AO whose end_time_ns clock continues
+    // advancing after reset-based pause. Not a physical-output delay guarantee.
+    bool has_pause_clock_tail;
     // Init the device using ao->format/ao->channels/ao->samplerate. If the
     // device doesn't accept these parameters, you can attempt to negotiate
     // fallback parameters, and set the ao format fields accordingly.

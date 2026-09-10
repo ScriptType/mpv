@@ -96,6 +96,8 @@ bool ao_untimed(struct ao *ao);
 int ao_control(struct ao *ao, enum aocontrol cmd, void *arg);
 void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);
+// Estimated pull clock advancement after a reset-based pause, or -1 if unknown.
+double ao_get_pause_clock_tail(struct ao *ao);
 void ao_reset(struct ao *ao);
 void ao_start(struct ao *ao);
 void ao_set_paused(struct ao *ao, bool paused, bool eof);

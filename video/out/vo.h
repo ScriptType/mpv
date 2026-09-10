@@ -535,6 +535,8 @@ void vo_queue_frame(struct vo *vo, struct vo_frame *frame);
 void vo_wait_frame(struct vo *vo);
 void vo_wait_on_vo(struct vo *vo, bool wait);
 bool vo_still_displaying(struct vo *vo);
+// Host-clock end of the last queued non-display-synced frame, or -1 if unknown.
+int64_t vo_get_last_frame_end(struct vo *vo);
 void vo_request_wakeup_on_done(struct vo *vo);
 bool vo_has_frame(struct vo *vo);
 void vo_redraw(struct vo *vo);

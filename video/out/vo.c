@@ -813,6 +813,17 @@ bool vo_still_displaying(struct vo *vo)
     return res;
 }
 
+int64_t vo_get_last_frame_end(struct vo *vo)
+{
+    struct vo_internal *in = vo->in;
+    mp_mutex_lock(&in->lock);
+    struct vo_frame *frame = in->frame_queued ? in->frame_queued : in->current_frame;
+    int64_t end = frame && !frame->display_synced && frame->pts > 0 && frame->duration >= 0
+        ? frame->pts + frame->duration : -1;
+    mp_mutex_unlock(&in->lock);
+    return end;
+}
+
 // Make vo issue a wakeup once vo_still_displaying() becomes false.
 void vo_request_wakeup_on_done(struct vo *vo)
 {
