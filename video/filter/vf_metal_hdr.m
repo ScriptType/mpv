@@ -27,6 +27,7 @@
 #include "video/mp_image.h"
 #include "video/out/vo.h"
 #include "video/filter/metal_hdr_decoder.h"
+#include "video/filter/metal_hdr_live_policy.h"
 
 #define HDR_SLOTS 3
 #define HDR_POOL_BUFFERS 6
@@ -53,6 +54,7 @@ struct hdr_result {
 
 struct hdr_pending {
     uint64_t frame_id;
+    uint64_t qualification_epoch;
     struct mp_image *image;
     double submitted_host;
     bool preview;
@@ -99,8 +101,7 @@ struct priv {
     bool measurements_configured;
     struct mp_async_video_state *state;
     bool need_preview, preview_emitted, retry_admission;
-    double completed_times[60];
-    uint64_t completed_samples;
+    struct mp_hdr_live_policy live_policy;
 };
 
 static void refresh_prepared(struct priv *p)
@@ -123,10 +124,15 @@ static void refresh_prepared(struct priv *p)
 
 static void update_state(struct priv *p)
 {
+    p->opts->policy = p->live_policy.mode == MP_HDR_ADAPTIVE;
     if (!p->state || p->state->owner != p)
         return;
     p->state->active = !p->opts->bypass && !p->dovi_detected;
     p->state->adaptive = p->opts->policy == 1 && p->state->active;
+    p->state->live = p->live_policy.mode == MP_HDR_LIVE;
+    p->state->live_qualified = p->live_policy.qualified;
+    p->state->warmed_samples = p->live_policy.warmed_samples;
+    p->state->completed_p95 = p->live_policy.p95;
     p->state->pending = p->pending_count + (p->preview_emitted ? 1 : 0);
     p->state->generation = fe_session_generation(p->session);
     p->state->processing_width = p->opts->processing_width;
@@ -139,38 +145,33 @@ static void update_state(struct priv *p)
     p->state->revision++;
 }
 
-static int compare_double(const void *a, const void *b)
+static struct mp_hdr_live_settings live_settings(struct priv *p)
 {
-    double x = *(const double *)a, y = *(const double *)b;
-    return (x > y) - (x < y);
+    return (struct mp_hdr_live_settings){
+        .have_model = p->opts->model && p->opts->model[0],
+        .prepared = !!p->prepared,
+        .bypass = p->opts->bypass || p->dovi_detected,
+        .width = p->opts->processing_width,
+        .height = p->opts->processing_height,
+        .strength = p->opts->strength,
+    };
 }
 
-static void qualify_live(struct mp_filter *f, double seconds)
+static void live_policy_updated(struct mp_filter *f, bool was_live)
+{
+    struct priv *p = f->priv;
+    if (was_live && p->live_policy.mode == MP_HDR_ADAPTIVE)
+        MP_WARN(f, "Live deadline qualification lost; switching to Adaptive shared-clock buffering\n");
+    update_state(p);
+}
+
+static void qualify_live(struct mp_filter *f, uint64_t epoch, double seconds)
 {
     struct priv *p = f->priv;
     if (!p->state) return;
-    // Measure this immutable model/settings/hardware session. Exclude three cold
-    // completions, then require a full 60-frame window with 20% deadline margin.
-    if (++p->completed_samples <= 3) return;
-    uint64_t count = p->completed_samples - 3;
-    p->completed_times[(count - 1) % 60] = seconds;
-    p->state->warmed_samples = count;
-    double sorted[60];
-    int n = MPMIN(count, 60);
-    memcpy(sorted, p->completed_times, n * sizeof(double));
-    qsort(sorted, n, sizeof(double), compare_double);
-    p->state->completed_p95 = sorted[(int)ceil(n * .95) - 1];
-    bool qualified = !p->prepared && count >= 60 && p->opts->model && p->opts->model[0] &&
-        p->opts->strength > 0 && p->opts->processing_width >= 320 &&
-        p->opts->processing_height >= 192 && p->state->source_fps > 0 &&
-        p->state->completed_p95 <= .8 / p->state->source_fps;
-    p->state->live_qualified = qualified;
-    if (p->state->live && !qualified) {
-        p->state->live = false;
-        p->opts->policy = 1;
-        MP_WARN(f, "Live deadline qualification lost; switching to Adaptive shared-clock buffering\n");
-    }
-    update_state(p);
+    bool was_live = p->live_policy.mode == MP_HDR_LIVE;
+    mp_hdr_live_record(&p->live_policy, live_settings(p), epoch, seconds);
+    live_policy_updated(f, was_live);
 }
 
 static void release_result(struct hdr_result *result)
@@ -390,14 +391,10 @@ static void reset(struct mp_filter *f)
     p->have_input_params = false;
     p->need_preview = true;
     p->preview_emitted = false;
-    p->completed_samples = 0;
+    mp_hdr_live_invalidate(&p->live_policy);
     if (p->state && p->state->owner == p) {
         mp_image_unrefp(&p->state->replacement);
         p->state->waiting_preview = false;
-        p->state->live_qualified = false;
-        p->state->warmed_samples = 0;
-        if (p->state->live) p->opts->policy = 1;
-        p->state->live = false;
     }
     mp_mutex_lock(&p->lock);
     for (int n = 0; n < p->result_count; n++)
@@ -713,7 +710,8 @@ static void process(struct mp_filter *f)
             p->active_work--;
             mp_cond_signal(&p->wakeup);
             mp_mutex_unlock(&p->lock);
-            qualify_live(f, output.normalized_host - pending.submitted_host);
+            qualify_live(f, pending.qualification_epoch,
+                         output.normalized_host - pending.submitted_host);
             update_state(p);
             refresh_prepared(p);
             if (p->measurements) {
@@ -772,6 +770,9 @@ static void process(struct mp_filter *f)
         p->state->source_width = image->w;
         p->state->source_height = image->h;
     }
+    bool was_live = p->live_policy.mode == MP_HDR_LIVE;
+    if (mp_hdr_live_observe_fps(&p->live_policy, image->nominal_fps))
+        live_policy_updated(f, was_live);
     int dovi_path = native_dovi_path(f, image);
     if (dovi_path < 0) {
         // A failed user filter is automatically removed by mpv, which would
@@ -837,6 +838,7 @@ static void process(struct mp_filter *f)
         return;
     }
     p->pending[p->pending_count++] = (struct hdr_pending){ .frame_id = p->next_frame++,
+        .qualification_epoch = p->live_policy.epoch,
         .image = image, .submitted_host = CACurrentMediaTime(), .preview = p->preview_emitted };
     p->need_preview = false;
     p->preview_emitted = false;
@@ -884,14 +886,15 @@ static bool command(struct mp_filter *f, struct mp_filter_command *command)
     }
     if (!strcmp(command->cmd, "policy")) {
         if (!strcmp(command->arg, "live")) {
-            if (!p->state || !p->state->live_qualified || p->opts->bypass) {
+            if (!p->state || !mp_hdr_live_request(&p->live_policy,
+                                                 live_settings(p), MP_HDR_LIVE)) {
+                update_state(p);
                 MP_WARN(f, "Live requires a qualified non-tiny neural session: 60 warmed completions with 20%% source-deadline headroom\n");
                 return false;
             }
-            p->opts->policy = 0; p->state->live = true;
         } else if (!strcmp(command->arg, "adaptive") || !strcmp(command->arg, "direct")) {
-            p->opts->policy = !strcmp(command->arg, "adaptive");
-            if (p->state) p->state->live = false;
+            mp_hdr_live_request(&p->live_policy, live_settings(p),
+                !strcmp(command->arg, "adaptive") ? MP_HDR_ADAPTIVE : MP_HDR_DIRECT);
         } else return false;
         update_state(p);
         mp_filter_wakeup(f);
@@ -980,6 +983,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
     if (!f) { talloc_free(options); return NULL; }
     struct priv *p = f->priv;
     p->opts = talloc_steal(p, options);
+    mp_hdr_live_init(&p->live_policy, p->opts->policy == 1);
     struct mp_stream_info *info = mp_filter_find_stream_info(f);
     p->state = info ? info->async_video : NULL;
     if (p->state) {
@@ -987,6 +991,7 @@ static struct mp_filter *create(struct mp_filter *parent, void *options)
         p->state->waiting_preview = false;
         p->state->live = p->state->live_qualified = false;
         p->state->warmed_samples = 0;
+        p->state->completed_p95 = 0;
         p->state->prepared_json = NULL;
         p->state->owner = p;
     }

@@ -99,6 +99,10 @@ lavf_timing = executable('lavf-timing', 'lavf_timing.c',
     include_directories: incdir, dependencies: [libavformat, libavutil, libm])
 test('lavf-timing', lavf_timing)
 
+metal_hdr_live_policy = executable('metal-hdr-live-policy', 'metal_hdr_live_policy.c',
+    include_directories: incdir, dependencies: libm)
+test('metal-hdr-live-policy', metal_hdr_live_policy)
+
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
 
