@@ -52,6 +52,7 @@
 #include "stream/stream_curl.h"
 
 #include "demux.h"
+#include "lavf_timing.h"
 #include "dovi_split.h"
 #include "stheader.h"
 #include "options/m_config.h"
@@ -1594,9 +1595,6 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     demuxer->ts_resets_possible =
         priv->avif_flags & (AVFMT_TS_DISCONT | AVFMT_NOTIMESTAMPS);
 
-    if (avfc->start_time != AV_NOPTS_VALUE)
-        demuxer->start_time = avfc->start_time / (double)AV_TIME_BASE;
-
     demuxer->fully_read = priv->format_hack.fully_read;
 
 #ifdef AVFMTCTX_UNSEEKABLE
@@ -1625,7 +1623,13 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     double duration = av_duration > 0 ? av_duration : total_duration;
     if (duration <= 0 && priv->avfc->duration > 0)
         duration = (double)priv->avfc->duration / AV_TIME_BASE;
-    demuxer->duration = duration;
+    // Whitelisted formats may skip find_stream_info(), leaving the aggregate
+    // origin unknown despite complete stream headers. Preserve any supplied
+    // aggregate origin and longer duration; use only proven primary A/V bounds.
+    struct mp_lavf_timing timing = mp_lavf_resolve_timing(avfc, duration);
+    if (timing.start_time != AV_NOPTS_VALUE)
+        demuxer->start_time = timing.start_time / (double)AV_TIME_BASE;
+    demuxer->duration = timing.duration;
 
     if (demuxer->duration < 0 && priv->format_hack.no_seek_on_no_duration)
         demuxer->seekable = false;

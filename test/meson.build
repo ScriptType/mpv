@@ -95,6 +95,10 @@ image_generation = executable('image-generation', 'image_generation.c',
     link_with: [img_utils, test_utils])
 test('image-generation', image_generation)
 
+lavf_timing = executable('lavf-timing', 'lavf_timing.c',
+    include_directories: incdir, dependencies: [libavformat, libavutil, libm])
+test('lavf-timing', lavf_timing)
+
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
 
