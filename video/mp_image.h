@@ -116,6 +116,8 @@ typedef struct mp_image {
     // Per-output content provenance: 0 unknown, 1 original, 2 enhanced,
     // 3 prepared original, 4 prepared enhanced. Independent of pair selection.
     int async_content_kind;
+    int64_t async_duration_value;
+    int32_t async_duration_timescale;
     /* container reported FPS; can be incorrect, or 0 if unknown */
     double nominal_fps;
     /* for private use */

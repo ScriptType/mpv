@@ -25,6 +25,13 @@ class MacCommon: Common {
     var swapTime: UInt64 = 0
     let swapLock: NSCondition = NSCondition()
 
+    // Opt-in observation only: never use force_render-adjusted visibility.
+    private let visibilityDiagnostics = ProcessInfo.processInfo.environment["HDRPLAYER_MPV_VISIBILITY"] == "1"
+    private var visibilityObservers: [NSObjectProtocol] = []
+    private var visibilityTimer: Timer?
+    private var visibilityRecords = 0
+    private let visibilityRecordLimit = 4096
+
     @objc init(_ vo: UnsafeMutablePointer<vo>) {
         let log = LogHelper(mp_log_new(vo, vo.pointee.log, "mac"))
         let option = OptionHelper(vo, vo.pointee.global)
@@ -74,6 +81,7 @@ class MacCommon: Common {
             windowDidResize()
             updateICCProfile()
             configured = true
+            startVisibilityDiagnostics()
         }
 
         return configured
@@ -85,6 +93,7 @@ class MacCommon: Common {
         timer?.terminate()
 
         DispatchQueue.main.sync {
+            stopVisibilityDiagnostics()
             window?.delegate = nil
             window?.close()
 
@@ -121,6 +130,87 @@ class MacCommon: Common {
         return presentationWindow?.occlusionState.contains(.visible) ?? false ||
                option.vo.force_render ||
                needsInitialDraw
+    }
+
+    private func startVisibilityDiagnostics() {
+        guard visibilityDiagnostics, visibilityTimer == nil, visibilityRecords < visibilityRecordLimit else { return }
+        let center = NotificationCenter.default
+        let windowEvents: [(Notification.Name, String)] = [
+            (NSWindow.didChangeOcclusionStateNotification, "occlusion"),
+            (NSWindow.didBecomeKeyNotification, "became-key"),
+            (NSWindow.didResignKeyNotification, "resigned-key"),
+            (NSWindow.didBecomeMainNotification, "became-main"),
+            (NSWindow.didResignMainNotification, "resigned-main"),
+            (NSWindow.didMiniaturizeNotification, "minimize"),
+            (NSWindow.didDeminiaturizeNotification, "restore"),
+            (NSWindow.didChangeScreenNotification, "screen"),
+            (NSWindow.didChangeBackingPropertiesNotification, "backing"),
+            (NSWindow.didResizeNotification, "resize"),
+            (NSWindow.willCloseNotification, "close"),
+        ]
+        for (name, event) in windowEvents {
+            visibilityObservers.append(center.addObserver(forName: name, object: nil, queue: .main) { [weak self] note in
+                guard let self, let observed = note.object as? NSWindow,
+                      observed === self.presentationWindow else { return }
+                self.recordVisibility(event)
+            })
+        }
+        for (name, event) in [(NSApplication.didBecomeActiveNotification, "app-active"),
+                              (NSApplication.didResignActiveNotification, "app-inactive"),
+                              (NSApplication.didHideNotification, "app-hidden"),
+                              (NSApplication.didUnhideNotification, "app-unhidden")] {
+            visibilityObservers.append(center.addObserver(forName: name, object: NSApp, queue: .main) { [weak self] _ in
+                self?.recordVisibility(event)
+            })
+        }
+        recordVisibility("startup")
+        guard visibilityRecords < visibilityRecordLimit else { return }
+        let timer = Timer(timeInterval: 0.25, repeats: true) { [weak self] _ in self?.recordVisibility("periodic") }
+        visibilityTimer = timer
+        RunLoop.main.add(timer, forMode: .common)
+    }
+
+    private func recordVisibility(_ event: String) {
+        guard visibilityDiagnostics, visibilityRecords < visibilityRecordLimit else { return }
+        visibilityRecords += 1
+        let current = presentationWindow
+        let content = view.map { $0.convertToBacking($0.bounds).size } ?? .zero
+        let drawable = layer?.drawableSize ?? .zero
+        let state: [String: Any] = [
+            "schemaVersion": 1, "event": event, "hostSeconds": CACurrentMediaTime(),
+            "hostTicks": mach_absolute_time(), "sequence": visibilityRecords,
+            "windowNumber": current?.windowNumber ?? -1, "embedded": embeddedHost != nil,
+            "isVisible": current?.isVisible ?? false,
+            "occlusionVisible": current?.occlusionState.contains(.visible) ?? false,
+            "isMiniaturized": current?.isMiniaturized ?? false,
+            "isKey": current?.isKeyWindow ?? false, "isMain": current?.isMainWindow ?? false,
+            "appActive": NSApp.isActive, "appHidden": NSApp.isHidden,
+            "backingScale": current?.backingScaleFactor ?? 0,
+            "contentWidth": content.width, "contentHeight": content.height,
+            "drawableWidth": drawable.width, "drawableHeight": drawable.height,
+            "screenNumber": current?.screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber ?? -1,
+            "forceRenderRequested": option.vo.force_render,
+            "recordLimit": visibilityRecordLimit, "periodicIntervalSeconds": 0.25,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]),
+           let json = String(data: data, encoding: .utf8) {
+            // The explicit diagnostic flag enables these records independently
+            // of ordinary mpv log-level filtering. Each write is one full line.
+            fputs("HDRPLAYER_MPV_WINDOW_STATE \(json)\n", stderr)
+        }
+        if visibilityRecords == visibilityRecordLimit {
+            visibilityTimer?.invalidate(); visibilityTimer = nil
+            visibilityObservers.forEach { NotificationCenter.default.removeObserver($0) }
+            visibilityObservers.removeAll()
+        }
+    }
+
+    private func stopVisibilityDiagnostics() {
+        guard visibilityDiagnostics else { return }
+        recordVisibility("shutdown")
+        visibilityTimer?.invalidate(); visibilityTimer = nil
+        visibilityObservers.forEach { NotificationCenter.default.removeObserver($0) }
+        visibilityObservers.removeAll()
     }
 
     @objc func update(alpha: Bool) {

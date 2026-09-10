@@ -3,6 +3,7 @@
  * This file is part of mpv, licensed under LGPL 2.1 or later.
  */
 #import <CoreVideo/CoreVideo.h>
+#import <CoreGraphics/CoreGraphics.h>
 #import <Metal/Metal.h>
 #import <QuartzCore/QuartzCore.h>
 
@@ -245,6 +246,17 @@ static int start_normalization(struct priv *p, struct hdr_gpu_job *job)
         return 0;
     if (result != kCVReturnSuccess)
         return -1;
+    // Immutable publication metadata shared by gpu-next and optional AVKit.
+    CVBufferSetAttachment(job->buffer, kCVImageBufferColorPrimariesKey,
+                          kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(job->buffer, kCVImageBufferTransferFunctionKey,
+                          kCVImageBufferTransferFunction_Linear, kCVAttachmentMode_ShouldPropagate);
+    CGColorSpaceRef color_space = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearITUR_2020);
+    if (color_space) {
+        CVBufferSetAttachment(job->buffer, kCVImageBufferCGColorSpaceKey,
+                              color_space, kCVAttachmentMode_ShouldPropagate);
+        CGColorSpaceRelease(color_space);
+    }
     CVPixelBufferRef input = job->frame.pixel_buffer;
     if (CVMetalTextureCacheCreateTextureFromImage(NULL, p->texture_cache, input, NULL,
             MTLPixelFormatRGBA16Float, width, height, 0, &job->input_view) != kCVReturnSuccess ||
@@ -686,6 +698,8 @@ static void process(struct mp_filter *f)
             av_buffer_unref(&image->async_generation);
             image->async_generation = av_buffer_ref(p->generation);
             image->async_frame_generation = output.frame.generation;
+            image->async_duration_value = output.frame.duration.value;
+            image->async_duration_timescale = output.frame.duration.timescale;
             image->async_content_kind = output.content_kind;
             if (!mp_image_set_async_pair(image, pending.image)) {
                 talloc_free(image);

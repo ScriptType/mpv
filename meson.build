@@ -1855,7 +1855,8 @@ if get_option('libmpv')
                  description: 'mpv media player client library')
 
     headers = ['include/mpv/client.h', 'include/mpv/render.h',
-               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h']
+               'include/mpv/render_gl.h', 'include/mpv/stream_cb.h',
+               'include/mpv/hdr_frame.h']
     install_headers(headers, subdir: 'mpv')
 
     # Allow projects to build with libmpv by cloning into ./subprojects/mpv

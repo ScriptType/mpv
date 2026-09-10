@@ -626,6 +626,8 @@ void mp_image_copy_attributes(struct mp_image *dst, struct mp_image *src)
     dst->async_original = src->async_original;
     dst->async_preview = src->async_preview;
     dst->async_content_kind = src->async_content_kind;
+    dst->async_duration_value = src->async_duration_value;
+    dst->async_duration_timescale = src->async_duration_timescale;
     dst->params.vflip = src->params.vflip;
     dst->params.rotate = src->params.rotate;
     dst->params.stereo3d = src->params.stereo3d;

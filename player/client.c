@@ -46,6 +46,11 @@
 #include "command.h"
 #include "core.h"
 #include "client.h"
+#include "mpv/hdr_frame.h"
+
+struct hdr_budget;
+static void hdr_budget_unref(struct hdr_budget *budget);
+static void hdr_export_detach(mpv_handle *ctx);
 
 /*
  * Locking hierarchy:
@@ -81,6 +86,8 @@ struct mp_client_api {
     int num_custom_protocols;
 
     struct mpv_render_context *render_context;
+    struct hdr_budget *hdr_budget;
+    struct mpv_hdr_export *hdr_export;
 };
 
 struct observe_property {
@@ -110,6 +117,7 @@ struct mpv_handle {
     struct MPContext *mpctx;
     struct mp_client_api *clients;
     int64_t id;
+    struct mpv_hdr_export *hdr_export; // serialized native exporter owner
 
     // -- not thread-safe
     struct mpv_event *cur_event;
@@ -199,6 +207,7 @@ void mp_clients_destroy(struct MPContext *mpctx)
         abort();
     }
 
+    hdr_budget_unref(mpctx->clients->hdr_budget);
     mp_mutex_destroy(&mpctx->clients->lock);
     talloc_free(mpctx->clients);
     mpctx->clients = NULL;
@@ -430,6 +439,7 @@ static void mp_destroy_client(mpv_handle *ctx, bool terminate)
     struct mp_client_api *clients = ctx->clients;
 
     MP_DBG(ctx, "Destroying client handle...\n");
+    hdr_export_detach(ctx);
 
     if (terminate)
         mpv_command(ctx, (const char*[]){"quit", NULL});
@@ -2247,3 +2257,5 @@ bool mp_streamcb_lookup(struct mpv_global *g, const char *protocol,
     mp_mutex_unlock(&clients->lock);
     return found;
 }
+
+#include "hdr_frame.inc"

@@ -173,6 +173,12 @@ struct vo_internal {
     int frame_refs;                 // max frames the VO may reference at once
     uint64_t current_frame_id;
 
+    // Optional native consumer snapshot. One selected frame, no export queue.
+    bool hdr_export_enabled;
+    struct mp_image *hdr_selected;
+    uint64_t hdr_selected_id;
+    AVBufferRef *hdr_validity;
+
     double display_fps;
     double reported_display_fps;
 
@@ -182,6 +188,7 @@ struct vo_internal {
 extern const struct m_sub_options gl_video_conf;
 
 static void forget_frames(struct vo *vo);
+static void hdr_export_selected(struct vo *vo, struct vo_frame *frame);
 static MP_THREAD_VOID vo_thread(void *ptr);
 
 static bool get_desc(struct m_obj_desc *dst, int index)
@@ -696,6 +703,10 @@ void vo_control_async(struct vo *vo, int request, void *data)
 static void forget_frames(struct vo *vo)
 {
     struct vo_internal *in = vo->in;
+    mp_image_unrefp(&in->hdr_selected);
+    in->hdr_selected_id = 0;
+    if (in->hdr_validity)
+        atomic_fetch_add((_Atomic uint64_t *)in->hdr_validity->data, 1);
     in->hasframe = false;
     in->hasframe_rendered = false;
     in->drop_count = 0;
@@ -1045,6 +1056,9 @@ static bool render_frame(struct vo *vo)
         in->dropped_frame = prev_drop_count < vo->in->drop_count;
         in->rendering = false;
 
+        if (!in->dropped_frame)
+            hdr_export_selected(vo, frame);
+
         update_vsync_timing_after_swap(vo, &vsync);
     }
 
@@ -1110,6 +1124,11 @@ static void do_redraw(struct vo *vo)
 
     vo->driver->draw_frame(vo, frame);
     vo->driver->flip_page(vo);
+
+    mp_mutex_lock(&in->lock);
+    if (frame != &dummy)
+        hdr_export_selected(vo, frame);
+    mp_mutex_unlock(&in->lock);
 
     if (frame != &dummy && !(vo->driver->caps & VO_CAP_FRAMEOWNER))
         talloc_free(frame);
@@ -1224,6 +1243,7 @@ static MP_THREAD_VOID vo_thread(void *ptr)
     forget_frames(vo); // implicitly synchronized
     talloc_free(in->current_frame);
     in->current_frame = NULL;
+    av_buffer_unref(&in->hdr_validity);
     vo->driver->uninit(vo);
 done:
     TA_FREEP(&in->dr_helper);
@@ -1481,6 +1501,61 @@ struct mp_image *vo_get_current_frame(struct vo *vo)
         r = mp_image_new_ref(vo->in->current_frame->current);
     mp_mutex_unlock(&in->lock);
     return r;
+}
+
+// Called under the VO lock only after draw/flip (not proof of scanout).
+static void hdr_export_selected(struct vo *vo, struct vo_frame *frame)
+{
+    struct vo_internal *in = vo->in;
+    if (!in->hdr_export_enabled || !in->hdr_validity || !frame->current ||
+        !mp_image_is_current(frame->current) || in->hdr_selected_id == frame->frame_id)
+        return;
+    mp_image_unrefp(&in->hdr_selected);
+    in->hdr_selected = mp_image_new_ref(frame->current);
+    if (!in->hdr_selected) {
+        in->hdr_selected_id = 0;
+        atomic_fetch_add((_Atomic uint64_t *)in->hdr_validity->data, 1);
+        return;
+    }
+    // The export retains only this surface, not the paused comparison pair.
+    av_buffer_unref(&in->hdr_selected->async_pair);
+    in->hdr_selected_id = frame->frame_id;
+    atomic_fetch_add((_Atomic uint64_t *)in->hdr_validity->data, 1);
+}
+
+void vo_hdr_export_enable(struct vo *vo, bool enabled)
+{
+    mp_mutex_lock(&vo->in->lock);
+    struct vo_internal *in = vo->in;
+    bool starting = enabled && !in->hdr_export_enabled;
+    if (enabled && !in->hdr_validity) {
+        in->hdr_validity = av_buffer_allocz(sizeof(_Atomic uint64_t));
+        if (in->hdr_validity)
+            atomic_init((_Atomic uint64_t *)in->hdr_validity->data, 1);
+    }
+    in->hdr_export_enabled = enabled;
+    if (starting && in->hasframe_rendered && !in->rendering && !in->dropped_frame &&
+        !in->request_redraw && in->current_frame)
+        hdr_export_selected(vo, in->current_frame);
+    if (!enabled) {
+        mp_image_unrefp(&in->hdr_selected);
+        in->hdr_selected_id = 0;
+        if (in->hdr_validity)
+            atomic_fetch_add((_Atomic uint64_t *)in->hdr_validity->data, 1);
+    }
+    mp_mutex_unlock(&in->lock);
+}
+
+struct mp_image *vo_hdr_export_get(struct vo *vo, uint64_t *revision,
+                                  AVBufferRef **validity)
+{
+    mp_mutex_lock(&vo->in->lock);
+    struct vo_internal *in = vo->in;
+    struct mp_image *image = in->hdr_selected ? mp_image_new_ref(in->hdr_selected) : NULL;
+    *validity = in->hdr_validity ? av_buffer_ref(in->hdr_validity) : NULL;
+    *revision = in->hdr_validity ? atomic_load((_Atomic uint64_t *)in->hdr_validity->data) : 0;
+    mp_mutex_unlock(&in->lock);
+    return image;
 }
 
 static void run_replace_current(void *argument)

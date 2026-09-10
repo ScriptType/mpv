@@ -1934,6 +1934,12 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         .pts = p->last_pts,
         .drift_compensation = 0,
     );
+    // A retained seek replacement can refill the queue before swapchain
+    // reconfiguration lets draw_frame update last_pts. Match draw_frame's
+    // first-frame clamp instead of querying before the queue's oldest PTS.
+    struct pl_source_frame first;
+    if (pl_queue_peek(p->queue, 0, &first) && qparams.pts < first.pts)
+        qparams.pts = first.pts;
     status = pl_queue_update(p->queue, &mix, &qparams);
     mp_assert(status != PL_QUEUE_EOF);
     if (status == PL_QUEUE_ERR) {

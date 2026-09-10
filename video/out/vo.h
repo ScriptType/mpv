@@ -551,6 +551,10 @@ void vo_query_formats(struct vo *vo, uint8_t *list);
 void vo_event(struct vo *vo, int event);
 int vo_query_and_reset_events(struct vo *vo, int events);
 struct mp_image *vo_get_current_frame(struct vo *vo);
+struct AVBufferRef;
+void vo_hdr_export_enable(struct vo *vo, bool enabled);
+struct mp_image *vo_hdr_export_get(struct vo *vo, uint64_t *revision,
+                                  struct AVBufferRef **validity);
 // Replace pixels of the exact current async source identity without advancing
 // playback time. Executed on the VO thread; caller retains image ownership.
 bool vo_replace_current_frame(struct vo *vo, struct mp_image *image);
