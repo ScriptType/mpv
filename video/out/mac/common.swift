@@ -132,6 +132,13 @@ class Common: NSObject {
 
         NSApp.activate(ignoringOtherApps: option.vo.focus_on >= 1)
 
+        // Apply focus after ordering and requesting activation. The earlier
+        // makeKey() runs before this new CLI window is ordered on screen.
+        // Embedded hosts return above and retain their application's ordering.
+        if !minimized && option.vo.focus_on >= 1 {
+            window.makeKeyAndOrderFront(nil)
+        }
+
         // workaround for macOS 10.15 to refocus the previous App
         if option.vo.focus_on == 0 {
             previousActiveApp?.activate()

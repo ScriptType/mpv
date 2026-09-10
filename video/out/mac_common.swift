@@ -183,6 +183,8 @@ class MacCommon: Common {
             "isVisible": current?.isVisible ?? false,
             "occlusionVisible": current?.occlusionState.contains(.visible) ?? false,
             "isMiniaturized": current?.isMiniaturized ?? false,
+            "onActiveSpace": current?.isOnActiveSpace ?? false,
+            "windowFrame": current.map { NSStringFromRect($0.frame) } ?? "unavailable",
             "isKey": current?.isKeyWindow ?? false, "isMain": current?.isMainWindow ?? false,
             "appActive": NSApp.isActive, "appHidden": NSApp.isHidden,
             "backingScale": current?.backingScaleFactor ?? 0,
