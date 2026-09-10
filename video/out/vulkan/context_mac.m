@@ -17,6 +17,8 @@
 
 #import <QuartzCore/QuartzCore.h>
 
+#include <math.h>
+
 #include "video/out/gpu/context.h"
 #include "osdep/mac/swift.h"
 
@@ -27,6 +29,16 @@
 struct priv {
     struct mpvk_ctx vk;
     MacCommon *vo_mac;
+    // All metadata ownership/writes stay on the serialized VO thread. Keep the
+    // layer alive until Vulkan has finished with it, before MacCommon teardown.
+    CAMetalLayer *layer;
+    CGColorSpaceRef linear_colorspace;
+    CAEDRMetadata *linear_metadata;
+    uint64_t color_revision;
+    float linear_minimum;
+    float linear_maximum;
+    bool linear_hdr_active;
+    bool linear_contract_failed;
 };
 
 static void mac_vk_uninit(struct ra_ctx *ctx)
@@ -35,6 +47,9 @@ static void mac_vk_uninit(struct ra_ctx *ctx)
 
     ra_vk_ctx_uninit(ctx);
     mpvk_uninit(&p->vk);
+    [p->linear_metadata release];
+    [p->layer release];
+    CGColorSpaceRelease(p->linear_colorspace);
     [p->vo_mac uninit:ctx->vo];
 }
 
@@ -53,6 +68,102 @@ static void mac_vk_get_vsync(struct ra_ctx *ctx, struct vo_vsync_info *info)
 static int mac_vk_color_depth(struct ra_ctx *ctx)
 {
     return 0;
+}
+
+static void mac_vk_clear_linear_metadata(struct priv *p)
+{
+    // Layer access is supported on the rendering thread. Explicitly commit on
+    // this thread (which has no Core Animation run loop), without a main-queue
+    // round trip. Never hold this transaction lock while calling Vulkan.
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    [CATransaction lock];
+    if (p->layer.EDRMetadata)
+        p->layer.EDRMetadata = nil;
+    [CATransaction unlock];
+    [CATransaction commit];
+    [p->linear_metadata release];
+    p->linear_metadata = nil;
+    p->linear_hdr_active = false;
+}
+
+static bool mac_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
+{
+    struct priv *p = ctx->priv;
+    bool linear_bt2020 = params &&
+        params->color.transfer == PL_COLOR_TRC_LINEAR &&
+        params->color.primaries == PL_COLOR_PRIM_BT_2020 &&
+        params->repr.sys == PL_COLOR_SYSTEM_RGB &&
+        params->repr.levels == PL_COLOR_LEVELS_FULL;
+
+    if (!linear_bt2020) {
+        // Remove our optical units before Vulkan resumes PQ/HLG ownership.
+        // Also remove stale PQ metadata on an SDR transition: MoltenVK's SDR
+        // branch, like its linear branch, does not clear that metadata.
+        if (p->linear_hdr_active || !params || !pl_color_space_is_hdr(&params->color))
+            mac_vk_clear_linear_metadata(p);
+        p->linear_hdr_active = false;
+        return false;
+    }
+
+    // Keep Vulkan's normal BT.2020-linear surface/format selection. Returning
+    // external parameters preserves the source HDR range, which libplacebo's
+    // transfer-only HDR metadata gate otherwise discards for a linear target.
+    pl_color_space_infer(&params->color);
+    float minimum = params->color.hdr.min_luma;
+    float maximum = params->color.hdr.max_luma;
+    if (!isfinite(minimum) || !isfinite(maximum) || minimum < 0 || maximum <= minimum)
+        return false;
+    pl_swapchain_colorspace_hint(p->vk.swapchain, &params->color);
+
+    // Complete any pending colour/format recreation BEFORE writing metadata.
+    // Zero dimensions preserve the current size. An unchanged swapchain only
+    // takes libplacebo's mutex; recreation creates image wrappers but does not
+    // acquire a drawable. Apple's edrMetadata contract requires assignment
+    // before nextDrawable, which happens later in pl_swapchain_start_frame.
+    int width = 0, height = 0;
+    if (!pl_swapchain_resize(p->vk.swapchain, &width, &height) || width < 1 || height < 1)
+        return false;
+
+    uint64_t revision = p->vo_mac.displayColorRevision;
+    bool configured = false;
+    @autoreleasepool {
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [CATransaction lock];
+        CGColorSpaceRef colorspace = p->layer.colorspace;
+        configured = p->layer.pixelFormat == MTLPixelFormatRGBA16Float &&
+            colorspace && CFEqual(colorspace, p->linear_colorspace) &&
+            p->layer.wantsExtendedDynamicRangeContent;
+        if (configured && (!p->linear_hdr_active || revision != p->color_revision ||
+            minimum != p->linear_minimum || maximum != p->linear_maximum ||
+            p->layer.EDRMetadata != p->linear_metadata)) {
+            // PL_HDR_NORM and normalized engine RGB both use 1.0 = 203 nits.
+            // A fresh object also refreshes Core Animation on display changes.
+            CAEDRMetadata *metadata = [[CAEDRMetadata
+                HDR10MetadataWithMinLuminance:minimum maxLuminance:maximum
+                opticalOutputScale:PL_COLOR_SDR_WHITE] retain];
+            if (metadata) {
+                p->layer.EDRMetadata = metadata;
+                [p->linear_metadata release];
+                p->linear_metadata = metadata;
+                p->linear_minimum = minimum;
+                p->linear_maximum = maximum;
+                p->color_revision = revision;
+            } else {
+                configured = false;
+            }
+        }
+        [CATransaction unlock];
+        [CATransaction commit];
+    }
+    if (!configured)
+        mac_vk_clear_linear_metadata(p);
+    if (!configured && !p->linear_contract_failed)
+        MP_WARN(ctx, "Linear HDR layer contract unavailable after swapchain recreation.\n");
+    p->linear_contract_failed = !configured;
+    p->linear_hdr_active = configured;
+    return configured;
 }
 
 static bool mac_vk_check_visible(struct ra_ctx *ctx)
@@ -79,11 +190,16 @@ static bool mac_vk_init(struct ra_ctx *ctx)
     if (!p->vo_mac)
         goto error;
 
+    p->layer = [p->vo_mac.layer retain];
+    p->linear_colorspace = CGColorSpaceCreateWithName(kCGColorSpaceExtendedLinearITUR_2020);
+    if (!p->layer || !p->linear_colorspace)
+        goto error;
+
     VkMetalSurfaceCreateInfoEXT mac_info = {
         .sType = VK_STRUCTURE_TYPE_METAL_SURFACE_CREATE_INFO_EXT,
         .pNext = NULL,
         .flags = 0,
-        .pLayer = p->vo_mac.layer,
+        .pLayer = p->layer,
     };
 
     struct ra_ctx_params params = {
@@ -91,6 +207,7 @@ static bool mac_vk_init(struct ra_ctx *ctx)
         .get_vsync = mac_vk_get_vsync,
         .color_depth = mac_vk_color_depth,
         .check_visible = mac_vk_check_visible,
+        .set_color = mac_vk_set_color,
     };
 
     VkInstance inst = vk->vkinst->instance;
@@ -105,6 +222,10 @@ static bool mac_vk_init(struct ra_ctx *ctx)
 
     return true;
 error:
+    [p->layer release];
+    p->layer = nil;
+    CGColorSpaceRelease(p->linear_colorspace);
+    p->linear_colorspace = NULL;
     if (p->vo_mac)
         [p->vo_mac uninit:ctx->vo];
     return false;

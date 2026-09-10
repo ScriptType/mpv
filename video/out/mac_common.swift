@@ -25,6 +25,11 @@ class MacCommon: Common {
     var swapTime: UInt64 = 0
     let swapLock: NSCondition = NSCondition()
 
+    // AppKit callbacks invalidate renderer-owned colour state without making
+    // the VO thread synchronously dispatch to the main queue for every frame.
+    private let colorRevisionLock = NSLock()
+    private var colorRevision: UInt64 = 0
+
     // Opt-in observation only: never use force_render-adjusted visibility.
     private let visibilityDiagnostics = ProcessInfo.processInfo.environment["HDRPLAYER_MPV_VISIBILITY"] == "1"
     private var visibilityObservers: [NSObjectProtocol] = []
@@ -110,6 +115,15 @@ class MacCommon: Common {
             swapTime = 0
             swapLock.unlock()
         }
+    }
+
+    @objc var displayColorRevision: UInt64 {
+        colorRevisionLock.withLock { colorRevision }
+    }
+
+    private func invalidateDisplayColor() {
+        colorRevisionLock.withLock { colorRevision &+= 1 }
+        flagEvents(VO_EVENT_EXPOSE)
     }
 
     @objc func fillVsync(info: UnsafeMutablePointer<vo_vsync_info>) {
@@ -271,11 +285,17 @@ class MacCommon: Common {
     }
 
     override func windowDidChangeScreenProfile() {
+        invalidateDisplayColor()
         updateICCProfile()
+    }
+
+    override func windowDidChangeScreen() {
+        invalidateDisplayColor()
     }
 
     override func windowDidChangeBackingProperties() {
         layer?.contentsScale = presentationWindow?.backingScaleFactor ?? 1
+        invalidateDisplayColor()
         windowDidResize()
     }
 
