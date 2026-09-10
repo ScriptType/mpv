@@ -376,6 +376,8 @@ typedef struct MPContext {
     // the same value if the status line is updated at a time where no new
     // video frame is shown.
     double last_av_difference;
+    bool last_av_difference_valid;
+    double last_av_difference_audio_pts, last_av_difference_video_pts;
     /* timestamp of video frame currently visible on screen
      * (or at least queued to be flipped by VO) */
     double video_pts;
@@ -514,6 +516,8 @@ void reinit_audio_chain(struct MPContext *mpctx);
 int init_audio_decoder(struct MPContext *mpctx, struct track *track);
 int reinit_audio_filters(struct MPContext *mpctx);
 double playing_audio_pts(struct MPContext *mpctx);
+bool audio_is_clock_active(struct MPContext *mpctx);
+void update_audio_pause_state(struct MPContext *mpctx);
 void fill_audio_out_buffers(struct MPContext *mpctx);
 double written_audio_pts(struct MPContext *mpctx);
 void clear_audio_output_buffers(struct MPContext *mpctx);

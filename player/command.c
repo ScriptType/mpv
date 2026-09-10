@@ -881,8 +881,9 @@ static int mp_property_audio_pts(void *ctx, struct m_property *prop,
                                 int action, void *arg)
 {
     MPContext *mpctx = ctx;
-    if (!mpctx->playback_initialized || mpctx->audio_status < STATUS_PLAYING ||
-        mpctx->audio_status >= STATUS_EOF)
+    if (!mpctx->playback_initialized ||
+        ((mpctx->audio_status < STATUS_PLAYING || mpctx->audio_status >= STATUS_EOF) &&
+         !audio_is_clock_active(mpctx)))
         return M_PROPERTY_UNAVAILABLE;
 
     return property_time(action, arg, playing_audio_pts(mpctx));
@@ -1713,6 +1714,32 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         &mpctx->vo_chain->filter->async_video : &empty;
     struct mpv_node *r = arg;
     node_init(r, MPV_FORMAT_NODE_MAP, NULL);
+    // One core-thread snapshot. The scheduled tuple is cached at a video
+    // scheduling update; it is not a fresh physical A/V measurement.
+    node_map_add_string(r, "audio-status", mp_status_str(mpctx->audio_status));
+    node_map_add_string(r, "video-status", mp_status_str(mpctx->video_status));
+    bool audio_clock_active = audio_is_clock_active(mpctx);
+    double audio_pts = audio_clock_active ? playing_audio_pts(mpctx) : MP_NOPTS_VALUE;
+    node_map_add_flag(r, "audio-clock-active", audio_clock_active);
+    if (audio_pts != MP_NOPTS_VALUE && isfinite(audio_pts))
+        node_map_add_double(r, "audio-pts-seconds", audio_pts);
+    else
+        node_map_add(r, "audio-pts-seconds", MPV_FORMAT_NONE);
+    // AO exhaustion can happen without another video scheduling update. Mask
+    // the cached tuple once its current clock domain is no longer active.
+    bool scheduled_valid = mpctx->last_av_difference_valid && audio_clock_active &&
+        mpctx->video_status == STATUS_PLAYING && audio_pts != MP_NOPTS_VALUE &&
+        isfinite(audio_pts);
+    node_map_add_flag(r, "scheduled-avsync-valid", scheduled_valid);
+    if (scheduled_valid) {
+        node_map_add_double(r, "scheduled-avsync-seconds", mpctx->last_av_difference);
+        node_map_add_double(r, "scheduled-audio-pts-seconds", mpctx->last_av_difference_audio_pts);
+        node_map_add_double(r, "scheduled-video-pts-seconds", mpctx->last_av_difference_video_pts);
+    } else {
+        node_map_add(r, "scheduled-avsync-seconds", MPV_FORMAT_NONE);
+        node_map_add(r, "scheduled-audio-pts-seconds", MPV_FORMAT_NONE);
+        node_map_add(r, "scheduled-video-pts-seconds", MPV_FORMAT_NONE);
+    }
     node_map_add_flag(r, "prepared-supported", HAVE_FRAME_ENGINE);
     node_map_add_flag(r, "source-dolby-vision", s->source_dovi);
     node_map_add_string(r, "native-color-path", s->native_color_path ? s->native_color_path : "standard");

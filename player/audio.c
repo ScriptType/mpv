@@ -39,6 +39,7 @@
 
 #include "core.h"
 #include "command.h"
+#include "hdr_audio_clock.h"
 
 enum {
     AD_OK = 0,
@@ -227,8 +228,18 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
     ao_c->delaying_audio_start = false;
 }
 
+static void invalidate_scheduled_audio_clock(struct MPContext *mpctx)
+{
+    // An audio-only restart must not revive a tuple from the previous clock
+    // domain before another video scheduling update. Preserve legacy avsync.
+    mpctx->last_av_difference_valid = false;
+    mpctx->last_av_difference_audio_pts = MP_NOPTS_VALUE;
+    mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;
+}
+
 void reset_audio_state(struct MPContext *mpctx)
 {
+    invalidate_scheduled_audio_clock(mpctx);
     if (mpctx->ao_chain) {
         ao_chain_reset_state(mpctx->ao_chain);
         struct track *t = mpctx->ao_chain->track;
@@ -242,6 +253,7 @@ void reset_audio_state(struct MPContext *mpctx)
 
 void uninit_audio_out(struct MPContext *mpctx)
 {
+    invalidate_scheduled_audio_clock(mpctx);
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (ao_c) {
         ao_c->ao_queue = NULL;
@@ -286,6 +298,7 @@ static void ao_chain_uninit(struct ao_chain *ao_c)
 
 void uninit_audio_chain(struct MPContext *mpctx)
 {
+    invalidate_scheduled_audio_clock(mpctx);
     if (mpctx->ao_chain) {
         ao_chain_uninit(mpctx->ao_chain);
         mpctx->ao_chain = NULL;
@@ -494,8 +507,7 @@ static int reinit_audio_filters_and_output(struct MPContext *mpctx)
     ao_c->ao_resume_time =
         opts->audio_wait_open > 0 ? mp_time_sec() + opts->audio_wait_open : 0;
 
-    bool eof = mpctx->audio_status == STATUS_EOF;
-    ao_set_paused(mpctx->ao, get_internal_paused(mpctx), eof);
+    update_audio_pause_state(mpctx);
 
     ao_chain_set_ao(ao_c, mpctx->ao);
 
@@ -629,6 +641,38 @@ double playing_audio_pts(struct MPContext *mpctx)
     return pts - mpctx->audio_speed * ao_get_delay(mpctx->ao);
 }
 
+static struct mp_hdr_audio_clock_state audio_clock_state(struct MPContext *mpctx)
+{
+    struct mp_async_video_state *async = mpctx->vo_chain ?
+        &mpctx->vo_chain->filter->async_video : NULL;
+    bool enhancement_video = async && async->active &&
+        (async->adaptive || async->live) &&
+        mpctx->video_status == STATUS_PLAYING &&
+        mpctx->ao && !ao_untimed(mpctx->ao);
+    return (struct mp_hdr_audio_clock_state){
+        .playing = mpctx->audio_status == STATUS_PLAYING,
+        .draining_or_eof = mpctx->audio_status == STATUS_DRAINING ||
+                           mpctx->audio_status == STATUS_EOF,
+        .eof = mpctx->audio_status == STATUS_EOF,
+        .timed_enhancement_video = enhancement_video,
+        .ao_playing = enhancement_video && ao_is_playing(mpctx->ao),
+        .enhancement_hold = mpctx->paused_for_enhancement,
+    };
+}
+
+bool audio_is_clock_active(struct MPContext *mpctx)
+{
+    return mp_hdr_audio_clock_active(audio_clock_state(mpctx));
+}
+
+void update_audio_pause_state(struct MPContext *mpctx)
+{
+    if (mpctx->ao) {
+        bool drain_eof = mp_hdr_audio_drain_before_pause(audio_clock_state(mpctx));
+        ao_set_paused(mpctx->ao, get_internal_paused(mpctx), drain_eof);
+    }
+}
+
 // This garbage is needed for untimed AOs. These consume audio infinitely fast,
 // so try keeping approximate A/V sync by blocking audio transfer as needed.
 static void update_throttle(struct MPContext *mpctx)
@@ -724,6 +768,7 @@ static void ao_process(struct mp_filter *f)
             // get things done in the correct order.
             mp_pin_out_unread(f->ppins[0], frame);
             ao_c->start_pts_known = false;
+            invalidate_scheduled_audio_clock(mpctx);
             mpctx->audio_status = STATUS_SYNCING;
             mp_wakeup_core(mpctx);
             MP_VERBOSE(mpctx, "new audio frame after EOF\n");
@@ -942,6 +987,7 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
             mpctx->audio_status = STATUS_EOF;
             mp_wakeup_core(mpctx);
             // stops untimed AOs, stops pull AOs from streaming silence
+            invalidate_scheduled_audio_clock(mpctx);
             ao_reset(ao_c->ao);
         } else {
             if (!ao_c->ao_underrun) {
@@ -986,6 +1032,7 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
 // Drop data queued for output, or which the AO is currently outputting.
 void clear_audio_output_buffers(struct MPContext *mpctx)
 {
+    invalidate_scheduled_audio_clock(mpctx);
     if (mpctx->ao)
         ao_reset(mpctx->ao);
 }

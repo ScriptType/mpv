@@ -97,6 +97,14 @@ static void vo_chain_reset_state(struct vo_chain *vo_c)
     vo_c->underrun_signaled = false;
 }
 
+static void clear_av_diff(struct MPContext *mpctx)
+{
+    mpctx->last_av_difference = 0;
+    mpctx->last_av_difference_valid = false;
+    mpctx->last_av_difference_audio_pts = MP_NOPTS_VALUE;
+    mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;
+}
+
 void reset_video_state(struct MPContext *mpctx)
 {
     if (mpctx->paused_for_enhancement) {
@@ -122,7 +130,7 @@ void reset_video_state(struct MPContext *mpctx)
     mpctx->last_frame_duration = 0;
     mpctx->num_past_frames = 0;
     mpctx->total_avsync_change = 0;
-    mpctx->last_av_difference = 0;
+    clear_av_diff(mpctx);
     mpctx->mistimed_frames_total = 0;
     mpctx->drop_message_shown = 0;
     mpctx->audio_drift_compensation = 0;
@@ -383,7 +391,7 @@ static void adjust_sync(struct MPContext *mpctx, double v_pts, double frame_time
 {
     struct MPOpts *opts = mpctx->opts;
 
-    if (mpctx->audio_status != STATUS_PLAYING)
+    if (!audio_is_clock_active(mpctx))
         return;
 
     double a_pts = written_audio_pts(mpctx) + opts->audio_delay - mpctx->delay;
@@ -645,7 +653,7 @@ static void update_avsync_before_frame(struct MPContext *mpctx)
         mpctx->time_frame = 0;
     } else if (mpctx->display_sync_active || vo->opts->video_sync == VS_NONE) {
         // don't touch the timing
-    } else if (mpctx->audio_status == STATUS_PLAYING &&
+    } else if (audio_is_clock_active(mpctx) &&
                mpctx->video_status == STATUS_PLAYING &&
                !ao_untimed(mpctx->ao))
     {
@@ -687,9 +695,9 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
 {
     struct MPOpts *opts = mpctx->opts;
 
-    mpctx->last_av_difference = 0;
+    clear_av_diff(mpctx);
 
-    if (mpctx->audio_status != STATUS_PLAYING ||
+    if (!audio_is_clock_active(mpctx) ||
         mpctx->video_status != STATUS_PLAYING)
         return;
 
@@ -697,9 +705,13 @@ static void update_av_diff(struct MPContext *mpctx, double offset)
         return;
 
     double a_pos = playing_audio_pts(mpctx);
-    if (a_pos != MP_NOPTS_VALUE && mpctx->video_pts != MP_NOPTS_VALUE) {
-        mpctx->last_av_difference = a_pos - mpctx->video_pts
-                                  + opts->audio_delay + offset;
+    double difference = a_pos - mpctx->video_pts + opts->audio_delay + offset;
+    if (a_pos != MP_NOPTS_VALUE && mpctx->video_pts != MP_NOPTS_VALUE &&
+        isfinite(a_pos) && isfinite(mpctx->video_pts) && isfinite(difference)) {
+        mpctx->last_av_difference = difference;
+        mpctx->last_av_difference_audio_pts = a_pos;
+        mpctx->last_av_difference_video_pts = mpctx->video_pts;
+        mpctx->last_av_difference_valid = true;
     }
 
     if (fabs(mpctx->last_av_difference) > 0.5 && !mpctx->drop_message_shown) {
@@ -1163,7 +1175,7 @@ void write_video(struct MPContext *mpctx)
         if ((async->adaptive || async->live) && mpctx->video_status == STATUS_PLAYING &&
             !mpctx->paused_for_enhancement) {
             bool wait_for_video = vo_still_displaying(vo);
-            if (async->adaptive && wait_for_video && mpctx->ao && mpctx->audio_status == STATUS_PLAYING &&
+            if (async->adaptive && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
                 !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
                 // The measured CoreAudio pull clock can keep advancing after a
                 // reset-based pause. Account for that tail before the current
@@ -1232,7 +1244,7 @@ void write_video(struct MPContext *mpctx)
             goto error;
 
         mpctx->delay = 0;
-        mpctx->last_av_difference = 0;
+        clear_av_diff(mpctx);
 
         if (mpctx->video_status <= STATUS_PLAYING) {
             mpctx->video_status = STATUS_DRAINING;
@@ -1376,7 +1388,7 @@ void write_video(struct MPContext *mpctx)
 
     // Schedule frames directly against the audio clock for sparse video.
     if (vo_c->is_sparse && !mpctx->display_sync_active &&
-        mpctx->audio_status == STATUS_PLAYING &&
+        audio_is_clock_active(mpctx) &&
         mpctx->video_status == STATUS_PLAYING)
     {
         double apts = playing_audio_pts(mpctx);
