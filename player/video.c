@@ -20,6 +20,9 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "mpv_talloc.h"
 
@@ -63,6 +66,66 @@ static const char av_desync_help_text[] =
 "position will not match to the video (see A-V status field).\n"
 "Consider trying `--profile=fast` and/or `--hwdec=auto` as they may help.\n"
 "\n";
+
+enum adaptive_estimate {
+    ADAPTIVE_ESTIMATE_SKIPPED,
+    ADAPTIVE_ESTIMATE_NO_FRAME_END,
+    ADAPTIVE_ESTIMATE_INVALID_TAIL,
+    ADAPTIVE_ESTIMATE_INVALID_REMAINING,
+    ADAPTIVE_ESTIMATE_VALID,
+};
+
+struct adaptive_decision {
+    unsigned ticket;
+    uint64_t generation, buffer_count_before;
+    bool vo_still_displaying, wait_after, next_pts_available;
+    enum adaptive_estimate estimate;
+    int64_t decision_ns, frame_end_ns;
+    double tail, remaining, video_pts, next_pts;
+};
+
+static atomic_uint adaptive_trace_count;
+
+static unsigned adaptive_trace_ticket(void)
+{
+    unsigned count = atomic_load_explicit(&adaptive_trace_count, memory_order_relaxed);
+    if (count >= 128)
+        return 0;
+    const char *enabled = getenv("HDRPLAYER_ADAPTIVE_DECISION_TRACE");
+    if (!enabled || strcmp(enabled, "1") != 0)
+        return 0;
+    while (count < 128) {
+        if (atomic_compare_exchange_weak_explicit(&adaptive_trace_count, &count,
+                count + 1, memory_order_relaxed, memory_order_relaxed))
+            return count + 1;
+    }
+    return 0;
+}
+
+static void adaptive_trace_emit(struct MPContext *mpctx,
+                                const struct adaptive_decision *d)
+{
+    static const char *const estimates[] = {
+        "skipped", "no-frame-end", "invalid-tail", "invalid-remaining", "valid",
+    };
+    bool evaluated = d->estimate != ADAPTIVE_ESTIMATE_SKIPPED;
+    bool timed = d->estimate == ADAPTIVE_ESTIMATE_VALID ||
+                 d->estimate == ADAPTIVE_ESTIMATE_INVALID_REMAINING;
+    MP_VERBOSE(mpctx, "Adaptive decision: context=%p ticket=%u generation=%"PRIu64
+        " buffer-before=%"PRIu64" buffer-after=%"PRIu64" estimate=%s"
+        " vo-still-displaying=%d wait-after=%d action=%s"
+        " frame-end-ns=%s tail=%s decision-ns=%s remaining=%s timeout=%s"
+        " video=%.9f next=%s\n",
+        (void *)mpctx, d->ticket, d->generation, d->buffer_count_before,
+        mpctx->enhancement_buffer_count, estimates[d->estimate],
+        d->vo_still_displaying, d->wait_after, d->wait_after ? "wait" : "hold",
+        evaluated && d->frame_end_ns > 0 ? mp_tprintf(32, "%"PRId64, d->frame_end_ns) : "unavailable",
+        evaluated && isfinite(d->tail) && d->tail >= 0 ? mp_tprintf(32, "%.9f", d->tail) : "unavailable",
+        timed ? mp_tprintf(32, "%"PRId64, d->decision_ns) : "unavailable",
+        d->estimate == ADAPTIVE_ESTIMATE_VALID ? mp_tprintf(32, "%.9f", d->remaining) : "unavailable",
+        d->estimate == ADAPTIVE_ESTIMATE_VALID && d->remaining > 0 ? mp_tprintf(32, "%.9f", d->remaining) : "unavailable",
+        d->video_pts, d->next_pts_available ? mp_tprintf(32, "%.9f", d->next_pts) : "unavailable");
+}
 
 static bool recreate_video_filters(struct MPContext *mpctx)
 {
@@ -1174,7 +1237,19 @@ void write_video(struct MPContext *mpctx)
     if (r == VD_WAIT) {
         if ((async->adaptive || async->live) && mpctx->video_status == STATUS_PLAYING &&
             !mpctx->paused_for_enhancement) {
+            struct adaptive_decision trace = {
+                .ticket = async->adaptive ? adaptive_trace_ticket() : 0,
+            };
             bool wait_for_video = vo_still_displaying(vo);
+            if (trace.ticket) {
+                trace.generation = async->generation;
+                trace.buffer_count_before = mpctx->enhancement_buffer_count;
+                trace.vo_still_displaying = wait_for_video;
+                trace.video_pts = mpctx->video_pts;
+                trace.next_pts_available = mpctx->num_next_frames > 0;
+                if (trace.next_pts_available)
+                    trace.next_pts = mpctx->next_frames[0]->pts;
+            }
             if (async->adaptive && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
                 !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
                 // The measured CoreAudio pull clock can keep advancing after a
@@ -1183,9 +1258,22 @@ void write_video(struct MPContext *mpctx)
                 // Use the core timer as well as the potentially late VO wakeup.
                 int64_t frame_end = vo_get_last_frame_end(vo);
                 double tail = ao_get_pause_clock_tail(mpctx->ao);
+                if (trace.ticket) {
+                    trace.frame_end_ns = frame_end;
+                    trace.tail = tail;
+                    trace.estimate = frame_end > 0 ? ADAPTIVE_ESTIMATE_INVALID_TAIL
+                                                   : ADAPTIVE_ESTIMATE_NO_FRAME_END;
+                }
                 if (frame_end > 0 && isfinite(tail) && tail >= 0) {
                     double lead = tail + .002;
-                    double remaining = MP_TIME_NS_TO_S(frame_end - mp_time_ns()) - lead;
+                    int64_t decision_ns = mp_time_ns();
+                    double remaining = MP_TIME_NS_TO_S(frame_end - decision_ns) - lead;
+                    if (trace.ticket) {
+                        trace.decision_ns = decision_ns;
+                        trace.remaining = remaining;
+                        trace.estimate = isfinite(remaining) ? ADAPTIVE_ESTIMATE_VALID
+                                                            : ADAPTIVE_ESTIMATE_INVALID_REMAINING;
+                    }
                     // An unavailable estimate retains the ordinary VO deadline.
                     if (isfinite(remaining)) {
                         if (remaining > 0)
@@ -1214,6 +1302,10 @@ void write_video(struct MPContext *mpctx)
                     "video=%.9f audio-before=%.9f audio-after=%.9f transition=%.9f\n",
                     mpctx->video_pts, audio_before_pause, playing_audio_pts(mpctx),
                     mp_time_sec() - mpctx->enhancement_buffer_start);
+            }
+            if (trace.ticket) {
+                trace.wait_after = wait_for_video;
+                adaptive_trace_emit(mpctx, &trace);
             }
         }
         // Heuristic to detect underruns.
