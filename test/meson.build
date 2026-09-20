@@ -107,6 +107,10 @@ hdr_audio_clock = executable('hdr-audio-clock', 'hdr_audio_clock.c',
     include_directories: incdir)
 test('hdr-audio-clock', hdr_audio_clock)
 
+audio_media_timeline = executable('audio-media-timeline', 'audio_media_timeline.c',
+    include_directories: incdir, dependencies: libm)
+test('audio-media-timeline', audio_media_timeline)
+
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
 
