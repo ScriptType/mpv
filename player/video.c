@@ -20,6 +20,9 @@
 #include <inttypes.h>
 #include <math.h>
 #include <assert.h>
+#include <float.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "mpv_talloc.h"
 
@@ -43,6 +46,7 @@
 #include "video/out/vo.h"
 
 #include "core.h"
+#include "adaptive_media_schedule.h"
 #include "command.h"
 #include "screenshot.h"
 #include "client.h"
@@ -105,8 +109,254 @@ static void clear_av_diff(struct MPContext *mpctx)
     mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;
 }
 
+void adaptive_media_gate_reset(struct MPContext *mpctx, const char *reason)
+{
+    struct adaptive_media_gate *g = &mpctx->media_gate;
+    if (!g->active)
+        return;
+    if (mpctx->stop_play == KEEP_PLAYING) {
+        adaptive_media_gate_fail(mpctx, reason);
+        return;
+    }
+    // Explicit quit/teardown owns cancellation; natural EOF already drained.
+    if (mpctx->ao) {
+        ao_media_gate_snapshot(mpctx->ao, &g->stopped_audio);
+        ao_reset(mpctx->ao);
+    }
+    for (unsigned i = 0; i < g->count; i++)
+        mp_image_unrefp(&g->credits[i].image);
+    g->count = 0;
+    g->active = g->terminal = false;
+    g->epoch++;
+    g->status = "stopped";
+    clear_av_diff(mpctx);
+}
+
+void adaptive_media_gate_fail(struct MPContext *mpctx, const char *reason)
+{
+    struct adaptive_media_gate *g = &mpctx->media_gate;
+    if (!g->active || g->contract_failed)
+        return;
+    ao_media_gate_snapshot(mpctx->ao, &g->stopped_audio);
+    g->contract_failed = true;
+    g->failure_reason = reason;
+    g->status = reason;
+    g->failure_credits = g->count;
+    g->failure_scheduled_valid = mpctx->last_av_difference_valid;
+    g->failure_audio_pts = mpctx->last_av_difference_audio_pts;
+    g->failure_video_pts = mpctx->last_av_difference_video_pts;
+    g->failure_avsync = mpctx->last_av_difference;
+    g->schedule_failures++;
+    MP_ERR(mpctx, "Adaptive media gate contract failure: reason=%s epoch=%"PRIu64
+        " credits=%u scheduled-valid=%d audio=%.9f video=%.9f avsync=%.9f\n",
+        reason, g->epoch, g->count, g->failure_scheduled_valid,
+        g->failure_audio_pts, g->failure_video_pts, g->failure_avsync);
+    ao_reset(mpctx->ao);
+    for (unsigned i = 0; i < g->count; i++)
+        mp_image_unrefp(&g->credits[i].image);
+    g->count = 0;
+    g->active = g->terminal = false;
+    g->epoch++;
+    clear_av_diff(mpctx);
+    mpctx->error_playing = MPV_ERROR_GENERIC;
+    mpctx->stop_play = PT_ERROR;
+    mp_wakeup_core(mpctx);
+}
+
+enum media_credit_result { MEDIA_CREDIT_ADDED, MEDIA_CREDIT_FULL, MEDIA_CREDIT_ERROR };
+
+static enum media_credit_result media_gate_credit(
+    struct MPContext *mpctx, struct mp_image *image, bool scheduled)
+{
+    struct adaptive_media_gate *g = &mpctx->media_gate;
+    for (unsigned i = 0; i < g->count; i++) {
+        if (mp_image_same_async_identity(image, g->credits[i].image)) {
+            g->credits[i].scheduled |= scheduled;
+            return MEDIA_CREDIT_ADDED;
+        }
+    }
+    if (g->count == 2)
+        return MEDIA_CREDIT_FULL;
+    if (!image || image->async_preview ||
+        !image->async_pair || !image->async_generation ||
+        !mp_image_is_current(image) || image->async_frame_generation != g->generation ||
+        !isfinite(image->pts) || image->pts == MP_NOPTS_VALUE ||
+        image->async_duration_value <= 0 || image->async_duration_timescale <= 0)
+    {
+        adaptive_media_gate_fail(mpctx, "invalid-image-credit");
+        return MEDIA_CREDIT_ERROR;
+    }
+    double end = image->pts + (double)image->async_duration_value /
+                                image->async_duration_timescale;
+    if (!isfinite(end) || end <= image->pts) {
+        adaptive_media_gate_fail(mpctx, "invalid-image-interval");
+        return MEDIA_CREDIT_ERROR;
+    }
+    if (g->has_credit && (image->pts > nextafter(g->credit_end, INFINITY) ||
+                          end <= g->credit_end)) {
+        adaptive_media_gate_fail(mpctx, "noncontiguous-image-credit");
+        return MEDIA_CREDIT_ERROR;
+    }
+    struct mp_image *retained = mp_image_new_ref(image);
+    if (!retained) {
+        adaptive_media_gate_fail(mpctx, "image-retention-failed");
+        return MEDIA_CREDIT_ERROR;
+    }
+    g->has_credit = true;
+    g->credit_end = end;
+    g->credits[g->count++] = (struct adaptive_media_credit){
+        .image = retained, .end = end, .scheduled = scheduled,
+    };
+    g->peak = MPMAX(g->peak, g->count);
+    return MEDIA_CREDIT_ADDED;
+}
+
+bool adaptive_media_gate_start(struct MPContext *mpctx)
+{
+    struct adaptive_media_gate *g = &mpctx->media_gate;
+    const char *flag = getenv("HDRPLAYER_ADAPTIVE_MEDIA_GATE");
+    g->requested = flag && !strcmp(flag, "1");
+    if (g->contract_failed)
+        return false;
+    if (!g->requested || g->active)
+        return true;
+    struct mp_async_video_state *async = mpctx->vo_chain ?
+        &mpctx->vo_chain->filter->async_video : NULL;
+    g->status = "unsupported-playback";
+    if (!async || !async->active || !async->adaptive || !mpctx->video_out ||
+        mpctx->opts->untimed || mpctx->play_dir != 1 ||
+        VS_IS_DISP(mpctx->video_out->opts->video_sync) ||
+        mpctx->video_out->driver->caps & VO_CAP_UNTIMED)
+        return true;
+    struct mp_image *anchor = vo_get_current_frame(mpctx->video_out);
+    if (!anchor || !anchor->async_generation || !anchor->async_pair ||
+        !mp_image_is_current(anchor) || anchor->async_preview || async->waiting_preview) {
+        talloc_free(anchor);
+        g->status = "awaiting-enhanced-anchor";
+        return false;
+    }
+    g->epoch++;
+    g->released_media = -DBL_MAX;
+    g->generation = async->generation;
+    g->configured_audio_delay = mpctx->opts->audio_delay;
+    g->status = "unsupported-ao";
+    if (!ao_media_gate_begin(mpctx->ao, g->epoch, anchor->async_generation, g->generation)) {
+        talloc_free(anchor);
+        return true;
+    }
+    g->active = true;
+    g->status = "closed";
+    enum media_credit_result credit = media_gate_credit(mpctx, anchor, true);
+    talloc_free(anchor);
+    if (credit != MEDIA_CREDIT_ADDED) {
+        adaptive_media_gate_fail(mpctx, "initial-credit-failed");
+        return false;
+    }
+    // Credit is published on the next core turn, after the closed AO starts.
+    return true;
+}
+
+void adaptive_media_gate_update(struct MPContext *mpctx)
+{
+    struct adaptive_media_gate *g = &mpctx->media_gate;
+    if (!g->active || !mpctx->ao)
+        return;
+    struct mp_async_video_state *async = mpctx->vo_chain ?
+        &mpctx->vo_chain->filter->async_video : NULL;
+    if (!async || async->generation != g->generation) {
+        adaptive_media_gate_fail(mpctx, "generation-reset");
+        return;
+    }
+    if (!async->active || !async->adaptive || !mpctx->video_out ||
+        mpctx->opts->untimed || mpctx->play_dir != 1 ||
+        VS_IS_DISP(mpctx->video_out->opts->video_sync) ||
+        mpctx->video_out->driver->caps & VO_CAP_UNTIMED) {
+        adaptive_media_gate_fail(mpctx, "unsupported-policy-change");
+        return;
+    }
+    if (mpctx->opts->audio_delay != g->configured_audio_delay) {
+        adaptive_media_gate_fail(mpctx, "audio-delay-changed");
+        return;
+    }
+    struct ao_media_gate_snapshot snapshot;
+    ao_media_gate_snapshot(mpctx->ao, &snapshot);
+    if (snapshot.timeline.epoch != g->epoch || snapshot.mode == AO_MEDIA_DISABLED) {
+        adaptive_media_gate_fail(mpctx, "epoch-mismatch");
+        return;
+    }
+    double now = mp_time_sec();
+    while (g->count && g->credits[0].scheduled) {
+        struct adaptive_media_credit *credit = &g->credits[0];
+        double wall_end;
+        bool mapped = mp_media_timeline_wall_at_media(&snapshot.timeline, g->epoch,
+            credit->end - mpctx->opts->audio_delay, &wall_end);
+        if (!mapped && snapshot.input_eof && snapshot.timeline.count) {
+            const struct mp_media_segment *last = &snapshot.timeline.segments[
+                (snapshot.timeline.head + snapshot.timeline.count - 1) %
+                    MP_MEDIA_TIMELINE_CAPACITY];
+            wall_end = last->wall_end;
+            mapped = true;
+        }
+        if (!mapped || now < wall_end)
+            break;
+        g->released_media = credit->end - mpctx->opts->audio_delay;
+        mp_image_unrefp(&credit->image);
+        g->credits[0] = g->credits[1];
+        g->credits[1] = (struct adaptive_media_credit){0};
+        g->count--;
+    }
+    if (snapshot.input_eof) {
+        double final_media = snapshot.timeline.retired_media_end;
+        double final_wall = snapshot.timeline.retired_wall_end;
+        bool have_media = snapshot.timeline.has_retired || snapshot.timeline.count;
+        if (snapshot.timeline.count) {
+            const struct mp_media_segment *last = &snapshot.timeline.segments[
+                (snapshot.timeline.head + snapshot.timeline.count - 1) %
+                    MP_MEDIA_TIMELINE_CAPACITY];
+            final_media = last->media_end;
+            final_wall = last->wall_end;
+        }
+        bool video_only_tail = !have_media || now >= final_wall;
+        for (unsigned i = 0; i < g->count; i++) {
+            video_only_tail &= !g->credits[i].scheduled && (!have_media ||
+                g->credits[i].image->pts - mpctx->opts->audio_delay >= final_media);
+        }
+        if (video_only_tail) {
+            // next_frames retains these images; no audio mapping exists for them.
+            for (unsigned i = 0; i < g->count; i++)
+                mp_image_unrefp(&g->credits[i].image);
+            g->count = 0;
+            g->released_media = DBL_MAX;
+        }
+    }
+    if (g->terminal && !g->count)
+        g->released_media = DBL_MAX;
+    enum ao_media_gate_mode mode = g->terminal ? AO_MEDIA_TERMINAL :
+        g->count && !async->waiting_preview ? AO_MEDIA_CREDIT : AO_MEDIA_CLOSED;
+    double ceiling = g->count ? g->credits[g->count - 1].end -
+                               mpctx->opts->audio_delay : 0;
+    if (!ao_media_gate_control(mpctx->ao, g->epoch, mode, ceiling, now,
+                               g->released_media)) {
+        adaptive_media_gate_fail(mpctx, "publication-failed");
+        return;
+    }
+    ao_media_gate_snapshot(mpctx->ao, &snapshot);
+    if (snapshot.input_eof && !snapshot.timeline.count && !g->count) {
+        // All submitted output and presentation ownership have drained.
+        ao_reset(mpctx->ao);
+        g->active = false;
+        g->status = "drained";
+        mpctx->audio_status = STATUS_EOF;
+        mpctx->last_av_difference_valid = false;
+        mp_wakeup_core(mpctx);
+    } else if (g->count || snapshot.timeline.count) {
+        mp_set_timeout(mpctx, .005);
+    }
+}
+
 void reset_video_state(struct MPContext *mpctx)
 {
+    adaptive_media_gate_reset(mpctx, "video-reset");
     if (mpctx->paused_for_enhancement) {
         mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
         mpctx->paused_for_enhancement = false;
@@ -492,6 +742,17 @@ static int get_req_frames(struct MPContext *mpctx, bool eof)
 // Whether it's fine to call add_new_frame() now.
 static bool needs_new_frame(struct MPContext *mpctx)
 {
+    if (mpctx->media_gate.active) {
+        unsigned retained = mpctx->media_gate.count;
+        for (int n = 0; n < mpctx->num_next_frames; n++) {
+            bool credited = false;
+            for (unsigned i = 0; i < mpctx->media_gate.count; i++)
+                credited |= mp_image_same_async_identity(mpctx->next_frames[n],
+                    mpctx->media_gate.credits[i].image);
+            retained += !credited;
+        }
+        return mpctx->num_next_frames < 2 && retained < 2;
+    }
     return mpctx->num_next_frames < get_req_frames(mpctx, false);
 }
 
@@ -544,7 +805,8 @@ static int video_output_image(struct MPContext *mpctx, bool *logical_eof)
     if (vo_c->is_sparse)
         hrseek = false;
 
-    if (have_new_frame(mpctx, false))
+    if (have_new_frame(mpctx, false) &&
+        (!mpctx->media_gate.active || !needs_new_frame(mpctx)))
         return VD_NEW_FRAME;
 
     // Get a new frame if we need one.
@@ -986,6 +1248,8 @@ static void handle_display_sync_frame(struct MPContext *mpctx,
 
 static void schedule_frame(struct MPContext *mpctx, struct vo_frame *frame)
 {
+    if (mpctx->media_gate.active)
+        return;
     handle_display_sync_frame(mpctx, frame);
 
     if (mpctx->num_past_frames > 1 &&
@@ -1088,6 +1352,17 @@ static void apply_video_crop(struct MPContext *mpctx, struct vo *vo)
     }
 }
 
+static void media_gate_wait(struct MPContext *mpctx)
+{
+    if (mpctx->paused_for_enhancement)
+        return;
+    mpctx->paused_for_enhancement = true;
+    mpctx->enhancement_buffer_start = mp_time_sec();
+    mpctx->enhancement_buffer_count++;
+    update_internal_pause_state(mpctx);
+    mp_client_property_change(mpctx, "enhancement-state");
+}
+
 void write_video(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
@@ -1098,6 +1373,9 @@ void write_video(struct MPContext *mpctx)
     struct vo_chain *vo_c = mpctx->vo_chain;
     struct vo *vo = vo_c->vo;
     struct mp_async_video_state *async = &vo_c->filter->async_video;
+    adaptive_media_gate_update(mpctx);
+    if (mpctx->media_gate.contract_failed)
+        return;
     async->user_paused = opts->pause;
     async->seeking = mpctx->video_status == STATUS_SYNCING && mpctx->hrseek_active;
     async->seek_target = mpctx->hrseek_pts - (mpctx->hrseek_backstep ? 0 : .005);
@@ -1108,6 +1386,9 @@ void write_video(struct MPContext *mpctx)
             if (vo_replace_current_frame(vo, async->replacement)) {
                 MP_VERBOSE(mpctx, "Enhanced seek replacement at exact source PTS %"PRId64"/%d generation %"PRIu64"\n",
                     current->source_pts, current->source_timebase_den, current->async_frame_generation);
+                if (mpctx->media_gate.active &&
+                    media_gate_credit(mpctx, async->replacement, true) != MEDIA_CREDIT_ADDED)
+                    adaptive_media_gate_fail(mpctx, "replacement-credit-failed");
                 mp_image_unrefp(&async->replacement);
                 async->waiting_preview = false;
                 async->revision++;
@@ -1121,6 +1402,8 @@ void write_video(struct MPContext *mpctx)
         }
         talloc_free(current);
     }
+    if (mpctx->media_gate.contract_failed)
+        return;
     if (mpctx->enhancement_revision != async->revision) {
         mpctx->enhancement_revision = async->revision;
         mp_client_property_change(mpctx, "enhancement-state");
@@ -1175,7 +1458,7 @@ void write_video(struct MPContext *mpctx)
         if ((async->adaptive || async->live) && mpctx->video_status == STATUS_PLAYING &&
             !mpctx->paused_for_enhancement) {
             bool wait_for_video = vo_still_displaying(vo);
-            if (async->adaptive && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
+            if (async->adaptive && !mpctx->media_gate.active && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
                 !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
                 // The measured CoreAudio pull clock can keep advancing after a
                 // reset-based pause. Account for that tail before the current
@@ -1210,8 +1493,11 @@ void write_video(struct MPContext *mpctx)
                 double audio_before_pause = playing_audio_pts(mpctx);
                 update_internal_pause_state(mpctx);
                 mp_client_property_change(mpctx, "enhancement-state");
-                MP_VERBOSE(mpctx, "Adaptive enhancement buffer: both playback clocks paused; "
+                MP_VERBOSE(mpctx, "%s"
                     "video=%.9f audio-before=%.9f audio-after=%.9f transition=%.9f\n",
+                    mpctx->media_gate.active ?
+                        "Adaptive media gate waiting: video held; audio admission bounded; " :
+                        "Adaptive enhancement buffer: both playback clocks paused; ",
                     mpctx->video_pts, audio_before_pause, playing_audio_pts(mpctx),
                     mp_time_sec() - mpctx->enhancement_buffer_start);
             }
@@ -1228,6 +1514,10 @@ void write_video(struct MPContext *mpctx)
     }
 
     if (r == VD_EOF) {
+        if (mpctx->media_gate.active) {
+            mpctx->media_gate.terminal = true;
+            adaptive_media_gate_update(mpctx);
+        }
         if (mpctx->paused_for_enhancement) {
             mpctx->paused_for_enhancement = false;
             mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
@@ -1289,7 +1579,10 @@ void write_video(struct MPContext *mpctx)
         mpctx->video_status = STATUS_PLAYING;
 
     if (r != VD_NEW_FRAME) {
-        mp_wakeup_core(mpctx); // Decode more in next iteration.
+        if (mpctx->media_gate.active && !needs_new_frame(mpctx))
+            mp_set_timeout(mpctx, .005);
+        else
+            mp_wakeup_core(mpctx); // Decode more in next iteration.
         return;
     }
     // A sparse still-image stream may have no frame at the seek target.
@@ -1368,7 +1661,21 @@ void write_video(struct MPContext *mpctx)
         MP_VERBOSE(mpctx, "Video frame delayed due to waiting on subtitles.\n");
         return;
     }
-    if (mpctx->paused_for_enhancement) {
+    if (mpctx->media_gate.active) {
+        for (int n = 0; n < mpctx->num_next_frames; n++) {
+            enum media_credit_result result = media_gate_credit(mpctx, mpctx->next_frames[n], false);
+            if (result == MEDIA_CREDIT_ERROR)
+                return;
+            if (result == MEDIA_CREDIT_FULL) {
+                mp_set_timeout(mpctx, .005);
+                return;
+            }
+        }
+        adaptive_media_gate_update(mpctx);
+        if (mpctx->media_gate.contract_failed)
+            return;
+    }
+    if (mpctx->paused_for_enhancement && !mpctx->media_gate.active) {
         if (!vo_is_ready_for_frame(vo, -1))
             return;
         double resume_start = mp_time_sec();
@@ -1384,10 +1691,11 @@ void write_video(struct MPContext *mpctx)
     }
 
     mpctx->time_frame -= get_relative_time(mpctx);
-    update_avsync_before_frame(mpctx);
+    if (!mpctx->media_gate.active)
+        update_avsync_before_frame(mpctx);
 
     // Schedule frames directly against the audio clock for sparse video.
-    if (vo_c->is_sparse && !mpctx->display_sync_active &&
+    if (!mpctx->media_gate.active && vo_c->is_sparse && !mpctx->display_sync_active &&
         audio_is_clock_active(mpctx) &&
         mpctx->video_status == STATUS_PLAYING)
     {
@@ -1399,12 +1707,51 @@ void write_video(struct MPContext *mpctx)
 
     double time_frame = MPMAX(mpctx->time_frame, -1);
     int64_t pts = mp_time_ns() + (int64_t)(time_frame * 1e9);
+    struct ao_media_gate_snapshot gate_snapshot = {0};
+    struct mp_media_schedule media_schedule = {0};
+    if (mpctx->media_gate.active) {
+        struct adaptive_media_gate *g = &mpctx->media_gate;
+        ao_media_gate_snapshot(mpctx->ao, &gate_snapshot);
+        media_schedule = mp_media_schedule(&gate_snapshot.timeline, g->epoch,
+            mpctx->next_frames[0]->pts, opts->audio_delay, mp_time_sec());
+        if (media_schedule.status == MP_MEDIA_SCHEDULE_STALE ||
+            media_schedule.status == MP_MEDIA_SCHEDULE_INVALID) {
+            adaptive_media_gate_fail(mpctx, "invalid-schedule-mapping");
+            return;
+        }
+        if (media_schedule.status != MP_MEDIA_SCHEDULE_MAPPED) {
+            g->mapping_waits++;
+            g->status = gate_snapshot.timeline.epoch == g->epoch ?
+                "mapping-pending" : "mapping-stale";
+            // Preserve the last valid same-epoch tuple while no attempt exists.
+            media_gate_wait(mpctx);
+            mp_set_timeout(mpctx, .005);
+            return;
+        }
+        pts = MP_TIME_S_TO_NS(media_schedule.target_wall);
+        mpctx->time_frame = media_schedule.target_wall - mp_time_sec();
+    }
 
     // wait until VO wakes us up to get more frames
     // (NB: in theory, the 1st frame after display sync mode change uses the
     //      wrong waiting mode)
-    if (!vo_is_ready_for_frame(vo, mpctx->display_sync_active ? -1 : pts))
+    if (!vo_is_ready_for_frame(vo, mpctx->display_sync_active ? -1 : pts)) {
+        if (mpctx->media_gate.active)
+            media_gate_wait(mpctx);
         return;
+    }
+    if (mpctx->media_gate.active && mpctx->paused_for_enhancement) {
+        double resume_start = mp_time_sec();
+        double audio_before_resume = playing_audio_pts(mpctx);
+        mpctx->paused_for_enhancement = false;
+        mpctx->enhancement_buffer_seconds += resume_start - mpctx->enhancement_buffer_start;
+        update_internal_pause_state(mpctx);
+        mp_client_property_change(mpctx, "enhancement-state");
+        MP_VERBOSE(mpctx, "Adaptive media gate ready: video=%.9f next=%.9f "
+            "audio-before=%.9f audio-after=%.9f transition=%.9f\n",
+            mpctx->video_pts, mpctx->next_frames[0]->pts, audio_before_resume,
+            playing_audio_pts(mpctx), mp_time_sec() - resume_start);
+    }
 
     // In encoding mode, wait for the ao to finish initializing.
     if (mpctx->encode_lavc_ctx && mpctx->current_track[0][STREAM_AUDIO] && !mpctx->ao)
@@ -1444,6 +1791,37 @@ void write_video(struct MPContext *mpctx)
         frame->duration = MP_TIME_S_TO_NS(MPCLAMP(diff, 0, 10));
     }
 
+    if (mpctx->media_gate.active) {
+        struct adaptive_media_gate *g = &mpctx->media_gate;
+        ao_media_gate_snapshot(mpctx->ao, &gate_snapshot);
+        media_schedule = mp_media_schedule(&gate_snapshot.timeline, g->epoch,
+            mpctx->next_frames[0]->pts, opts->audio_delay, mp_time_sec());
+        mpctx->last_av_difference_valid = media_schedule.status == MP_MEDIA_SCHEDULE_MAPPED;
+        if (!mpctx->last_av_difference_valid) {
+            talloc_free(frame);
+            adaptive_media_gate_fail(mpctx, "schedule-mapping-failed");
+            return;
+        }
+        frame->pts = MP_TIME_S_TO_NS(media_schedule.target_wall);
+        g->mapped_wall = media_schedule.mapped_wall;
+        g->target_wall = media_schedule.target_wall;
+        g->lateness = media_schedule.lateness;
+        g->max_lateness = MPMAX(g->max_lateness, g->lateness);
+        g->late_frames += g->lateness > 0;
+        g->scheduled_frames++;
+        g->scheduled_epoch = g->epoch;
+        mpctx->last_av_difference_audio_pts = media_schedule.audio_pts;
+        mpctx->last_av_difference_video_pts = mpctx->next_frames[0]->pts;
+        mpctx->last_av_difference = media_schedule.av_difference;
+        bool failed = g->lateness > .020 || fabs(media_schedule.av_difference) > .020;
+        g->schedule_failures += failed;
+        g->status = failed ? "schedule-failed" : "mapped";
+        if (media_gate_credit(mpctx, mpctx->next_frames[0], true) != MEDIA_CREDIT_ADDED) {
+            talloc_free(frame);
+            adaptive_media_gate_fail(mpctx, "scheduled-credit-failed");
+            return;
+        }
+    }
     mpctx->video_pts = mpctx->next_frames[0]->pts;
     mpctx->last_frame_duration =
         mpctx->next_frames[0]->pkt_duration / mpctx->video_speed;
@@ -1485,8 +1863,13 @@ void write_video(struct MPContext *mpctx)
     // hr-seek past EOF -> returns last frame, but terminates playback. The
     // early EOF is needed to trigger the exit before the next seek is executed.
     // Always using early EOF breaks other cases, like images.
-    if (logical_eof && !mpctx->num_next_frames && mpctx->ao_chain)
+    if (logical_eof && !mpctx->num_next_frames && mpctx->ao_chain) {
         mpctx->video_status = STATUS_EOF;
+        if (mpctx->media_gate.active) {
+            mpctx->media_gate.terminal = true;
+            adaptive_media_gate_update(mpctx);
+        }
+    }
 
     if (mpctx->video_status != STATUS_EOF) {
         if (mpctx->step_frames > 0) {

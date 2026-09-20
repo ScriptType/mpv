@@ -1729,7 +1729,8 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     // the cached tuple once its current clock domain is no longer active.
     bool scheduled_valid = mpctx->last_av_difference_valid && audio_clock_active &&
         mpctx->video_status == STATUS_PLAYING && audio_pts != MP_NOPTS_VALUE &&
-        isfinite(audio_pts);
+        isfinite(audio_pts) && (!mpctx->media_gate.active ||
+        mpctx->media_gate.scheduled_epoch == mpctx->media_gate.epoch);
     node_map_add_flag(r, "scheduled-avsync-valid", scheduled_valid);
     if (scheduled_valid) {
         node_map_add_double(r, "scheduled-avsync-seconds", mpctx->last_av_difference);
@@ -1739,6 +1740,68 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         node_map_add(r, "scheduled-avsync-seconds", MPV_FORMAT_NONE);
         node_map_add(r, "scheduled-audio-pts-seconds", MPV_FORMAT_NONE);
         node_map_add(r, "scheduled-video-pts-seconds", MPV_FORMAT_NONE);
+    }
+    struct adaptive_media_gate *gate = &mpctx->media_gate;
+    struct ao_media_gate_snapshot gate_audio = {0};
+    if (gate->contract_failed)
+        gate_audio = gate->stopped_audio;
+    else if (mpctx->ao && gate->requested)
+        ao_media_gate_snapshot(mpctx->ao, &gate_audio);
+    node_map_add_flag(r, "media-gate-requested", gate->requested);
+    node_map_add_flag(r, "media-gate-active", gate->active);
+    node_map_add_flag(r, "media-gate-contract-failed", gate->contract_failed);
+    node_map_add_string(r, "media-gate-failure-reason", gate->failure_reason ? gate->failure_reason : "");
+    node_map_add_int64(r, "media-gate-failure-credits", gate->failure_credits);
+    node_map_add_flag(r, "media-gate-failure-scheduled-valid", gate->failure_scheduled_valid);
+    node_map_add_double(r, "media-gate-failure-audio-pts", gate->failure_audio_pts);
+    node_map_add_double(r, "media-gate-failure-video-pts", gate->failure_video_pts);
+    node_map_add_double(r, "media-gate-failure-avsync", gate->failure_avsync);
+    node_map_add_string(r, "media-gate-status", gate->status ? gate->status : "disabled");
+    node_map_add_int64(r, "media-gate-epoch", gate->epoch);
+    node_map_add_int64(r, "media-gate-scheduled-epoch", gate->scheduled_epoch);
+    node_map_add_int64(r, "media-gate-admitted-samples", gate_audio.admitted_samples);
+    node_map_add_int64(r, "media-gate-admitted-segments", gate_audio.admitted_segments);
+    node_map_add_int64(r, "media-gate-silent-callbacks", gate_audio.silent_callbacks);
+    node_map_add_int64(r, "media-gate-source-starvation-callbacks", gate_audio.source_starvation_callbacks);
+    node_map_add_int64(r, "media-gate-refused-copies", gate_audio.refused_copies);
+    node_map_add_int64(r, "media-gate-invalid-copies", gate_audio.invalid_copies);
+    node_map_add_int64(r, "media-gate-full-refusals", gate_audio.full_refusals);
+    node_map_add_int64(r, "media-gate-segments", gate_audio.timeline.count);
+    node_map_add_int64(r, "media-gate-segments-peak", gate_audio.segments_peak);
+    node_map_add_int64(r, "media-gate-credits", gate->count);
+    node_map_add_int64(r, "media-gate-credits-peak", gate->peak);
+    node_map_add_int64(r, "media-gate-mapping-waits", gate->mapping_waits);
+    node_map_add_int64(r, "media-gate-scheduled-frames", gate->scheduled_frames);
+    node_map_add_int64(r, "media-gate-late-frames", gate->late_frames);
+    node_map_add_int64(r, "media-gate-schedule-failures", gate->schedule_failures);
+    node_map_add_double(r, "media-gate-mapped-wall-seconds", gate->mapped_wall);
+    node_map_add_double(r, "media-gate-target-wall-seconds", gate->target_wall);
+    node_map_add_double(r, "media-gate-lateness-seconds", gate->lateness);
+    node_map_add_double(r, "media-gate-max-lateness-seconds", gate->max_lateness);
+    node_map_add_flag(r, "media-gate-input-eof", gate_audio.input_eof);
+    node_map_add_string(r, "media-gate-last-invalid-reason",
+                        gate_audio.last_invalid_reason ? gate_audio.last_invalid_reason : "");
+    node_map_add_double(r, "media-gate-invalid-media-start", gate_audio.invalid_media_start);
+    node_map_add_double(r, "media-gate-invalid-wall-start", gate_audio.invalid_wall_start);
+    node_map_add_double(r, "media-gate-prior-media-end", gate_audio.prior_media_end);
+    node_map_add_double(r, "media-gate-prior-wall-end", gate_audio.prior_wall_end);
+    node_map_add_int64(r, "media-gate-invalid-callback-samples", gate_audio.invalid_callback_samples);
+    node_map_add_int64(r, "media-gate-invalid-copy-offset", gate_audio.invalid_copy_offset);
+    double media_end = gate_audio.timeline.retired_media_end;
+    double wall_end = gate_audio.timeline.retired_wall_end;
+    if (gate_audio.timeline.count) {
+        struct mp_media_segment *last = &gate_audio.timeline.segments[
+            (gate_audio.timeline.head + gate_audio.timeline.count - 1) %
+                MP_MEDIA_TIMELINE_CAPACITY];
+        media_end = last->media_end;
+        wall_end = last->wall_end;
+    }
+    if (gate_audio.timeline.count || gate_audio.timeline.has_retired) {
+        node_map_add_double(r, "media-gate-last-media-end", media_end);
+        node_map_add_double(r, "media-gate-last-wall-end", wall_end);
+    } else {
+        node_map_add(r, "media-gate-last-media-end", MPV_FORMAT_NONE);
+        node_map_add(r, "media-gate-last-wall-end", MPV_FORMAT_NONE);
     }
     node_map_add_flag(r, "prepared-supported", HAVE_FRAME_ENGINE);
     node_map_add_flag(r, "source-dolby-vision", s->source_dovi);

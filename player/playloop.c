@@ -170,7 +170,12 @@ void set_pause_state(struct MPContext *mpctx, bool user_pause)
         mpctx->vo_chain->filter->async_video.user_paused = user_pause;
     mp_client_property_change(mpctx, "enhancement-state");
 
+    if (mpctx->media_gate.active && (user_pause || mpctx->paused_for_cache))
+        adaptive_media_gate_fail(mpctx, user_pause ? "user-pause" : "cache-pause");
     bool internal_paused = get_internal_paused(mpctx);
+    // The AO reason can change while the aggregate pause remains true.
+    if (mpctx->media_gate.active)
+        update_audio_pause_state(mpctx);
     if (internal_paused != mpctx->paused) {
         mpctx->paused = internal_paused;
 

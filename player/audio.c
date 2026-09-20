@@ -21,6 +21,8 @@
 #include <limits.h>
 #include <math.h>
 #include <assert.h>
+#include <stdlib.h>
+#include <string.h>
 
 #include "mpv_talloc.h"
 
@@ -239,6 +241,7 @@ static void invalidate_scheduled_audio_clock(struct MPContext *mpctx)
 
 void reset_audio_state(struct MPContext *mpctx)
 {
+    adaptive_media_gate_reset(mpctx, "audio-state-reset");
     invalidate_scheduled_audio_clock(mpctx);
     if (mpctx->ao_chain) {
         ao_chain_reset_state(mpctx->ao_chain);
@@ -253,6 +256,7 @@ void reset_audio_state(struct MPContext *mpctx)
 
 void uninit_audio_out(struct MPContext *mpctx)
 {
+    adaptive_media_gate_reset(mpctx, "ao-teardown");
     invalidate_scheduled_audio_clock(mpctx);
     struct ao_chain *ao_c = mpctx->ao_chain;
     if (ao_c) {
@@ -635,6 +639,15 @@ double written_audio_pts(struct MPContext *mpctx)
 // and playback speed.
 double playing_audio_pts(struct MPContext *mpctx)
 {
+    if (mpctx->media_gate.contract_failed)
+        return MP_NOPTS_VALUE;
+    if (mpctx->media_gate.active && mpctx->ao) {
+        struct ao_media_gate_snapshot snapshot;
+        ao_media_gate_snapshot(mpctx->ao, &snapshot);
+        double media;
+        return mp_media_timeline_media_at_wall(&snapshot.timeline,
+            mpctx->media_gate.epoch, mp_time_sec(), &media) ? media : MP_NOPTS_VALUE;
+    }
     double pts = written_audio_pts(mpctx);
     if (pts == MP_NOPTS_VALUE || !mpctx->ao)
         return pts;
@@ -662,14 +675,22 @@ static struct mp_hdr_audio_clock_state audio_clock_state(struct MPContext *mpctx
 
 bool audio_is_clock_active(struct MPContext *mpctx)
 {
-    return mp_hdr_audio_clock_active(audio_clock_state(mpctx));
+    return !mpctx->media_gate.contract_failed &&
+           mp_hdr_audio_clock_active(audio_clock_state(mpctx));
 }
 
 void update_audio_pause_state(struct MPContext *mpctx)
 {
     if (mpctx->ao) {
+        if (mpctx->media_gate.contract_failed)
+            return;
         bool drain_eof = mp_hdr_audio_drain_before_pause(audio_clock_state(mpctx));
-        ao_set_paused(mpctx->ao, get_internal_paused(mpctx), drain_eof);
+        bool paused = get_internal_paused(mpctx);
+        if (mpctx->media_gate.active) {
+            paused = mpctx->opts->pause || mpctx->paused_for_cache;
+            drain_eof = false;
+        }
+        ao_set_paused(mpctx->ao, paused, drain_eof);
     }
 }
 
@@ -877,8 +898,15 @@ static bool get_sync_pts(struct MPContext *mpctx, double *pts)
 void audio_start_ao(struct MPContext *mpctx)
 {
     struct ao_chain *ao_c = mpctx->ao_chain;
-    if (!ao_c || !ao_c->ao || mpctx->audio_status != STATUS_READY)
+    if (!ao_c || !ao_c->ao || mpctx->audio_status != STATUS_READY ||
+        mpctx->media_gate.contract_failed)
         return;
+    const char *gate = getenv("HDRPLAYER_ADAPTIVE_MEDIA_GATE");
+    if (gate && !strcmp(gate, "1") && (mpctx->opts->pause || mpctx->paused_for_cache)) {
+        mpctx->media_gate.requested = true;
+        mpctx->media_gate.status = "paused-before-start";
+        return;
+    }
     double pts = MP_NOPTS_VALUE;
     if (!get_sync_pts(mpctx, &pts))
         return;
@@ -898,8 +926,12 @@ void audio_start_ao(struct MPContext *mpctx)
         return;
     }
 
+    if (!adaptive_media_gate_start(mpctx))
+        return;
     MP_VERBOSE(mpctx, "starting audio playback\n");
     ao_c->delaying_audio_start = false;
+    if (mpctx->media_gate.active)
+        update_audio_pause_state(mpctx);
     ao_start(ao_c->ao);
     mpctx->audio_status = STATUS_PLAYING;
     if (ao_c->out_eof) {
@@ -915,8 +947,15 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
 {
     struct MPOpts *opts = mpctx->opts;
 
-    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD))
+    if (mpctx->media_gate.contract_failed)
+        return;
+    if (mpctx->ao && ao_query_and_reset_events(mpctx->ao, AO_EVENT_RELOAD)) {
+        if (mpctx->media_gate.active) {
+            adaptive_media_gate_fail(mpctx, "ao-reload");
+            return;
+        }
         reload_audio_output(mpctx);
+    }
 
     update_throttle(mpctx);
 
@@ -973,6 +1012,21 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
             mp_wakeup_core(mpctx);
             MP_VERBOSE(mpctx, "audio ready (and EOF)\n");
         }
+    }
+
+    if (mpctx->media_gate.active && ao_c->ao) {
+        adaptive_media_gate_update(mpctx);
+        if (mpctx->media_gate.contract_failed)
+            return;
+        struct ao_media_gate_snapshot snapshot;
+        ao_media_gate_snapshot(ao_c->ao, &snapshot);
+        if (mpctx->media_gate.active && snapshot.input_eof) {
+            mpctx->audio_status = STATUS_DRAINING;
+            mp_set_timeout(mpctx, .005);
+        }
+        if (mpctx->restart_complete)
+            audio_start_ao(mpctx);
+        return;
     }
 
     if (ao_c->ao && !ao_is_playing(ao_c->ao) && !ao_c->underrun &&
@@ -1032,6 +1086,7 @@ void fill_audio_out_buffers(struct MPContext *mpctx)
 // Drop data queued for output, or which the AO is currently outputting.
 void clear_audio_output_buffers(struct MPContext *mpctx)
 {
+    adaptive_media_gate_reset(mpctx, "audio-output-reset");
     invalidate_scheduled_audio_clock(mpctx);
     if (mpctx->ao)
         ao_reset(mpctx->ao);

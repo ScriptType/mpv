@@ -747,7 +747,11 @@ static void process(struct mp_filter *f)
         }
         return;
     }
-    if (p->pending_count >= HDR_SLOTS)
+    const char *media_gate = getenv("HDRPLAYER_ADAPTIVE_MEDIA_GATE");
+    bool gated = media_gate && !strcmp(media_gate, "1") &&
+                 p->state && p->state->adaptive;
+    if (gated ? p->pending_count + (p->preview_emitted ? 1 : 0) >= 2 :
+                p->pending_count >= HDR_SLOTS)
         return;
     if (!p->held_input.type)
         p->held_input = mp_pin_out_read(f->ppins[0]);

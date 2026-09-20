@@ -19,10 +19,15 @@
 #include <inttypes.h>
 #include <math.h>
 #include <errno.h>
+#include <float.h>
 #include <assert.h>
+#include <string.h>
+#include <stdatomic.h>
+#include <libavutil/buffer.h>
 
 #include "ao.h"
 #include "internal.h"
+#include "media_gate.h"
 #include "audio/aframe.h"
 #include "audio/format.h"
 
@@ -60,6 +65,10 @@ struct buffer_state {
     bool playing;               // logically playing audio from buffer
     bool paused;                // logically paused
     bool hw_paused;             // driver->set_pause() was used successfully
+
+    struct ao_media_gate_snapshot media;
+    AVBufferRef *media_generation;
+    uint64_t media_frame_generation;
 
     int64_t end_time_ns;        // absolute output time of last played sample
     int64_t queued_time_ns;     // duration of samples that have been queued to
@@ -115,23 +124,88 @@ struct mp_async_queue *ao_get_queue(struct ao *ao)
     return p->queue;
 }
 
+bool ao_media_gate_begin(struct ao *ao, uint64_t epoch,
+                         struct AVBufferRef *generation, uint64_t frame_generation)
+{
+    if (strcmp(ao->driver->name, "coreaudio") || ao->untimed || ao->stream_silence ||
+        !af_fmt_is_pcm(ao->format) || ao->driver->write)
+        return false;
+    AVBufferRef *ref = generation ? av_buffer_ref(generation) : NULL;
+    if (generation && !ref)
+        return false;
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    av_buffer_unref(&p->media_generation);
+    p->media_generation = ref;
+    p->media_frame_generation = frame_generation;
+    p->media = (struct ao_media_gate_snapshot){.mode = AO_MEDIA_CLOSED};
+    mp_media_timeline_reset(&p->media.timeline, epoch);
+    mp_mutex_unlock(&p->lock);
+    return true;
+}
+
+bool ao_media_gate_control(struct ao *ao, uint64_t epoch,
+                           enum ao_media_gate_mode mode, double ceiling,
+                           double played_wall, double released_media)
+{
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    bool valid = p->media.mode != AO_MEDIA_DISABLED &&
+        epoch == p->media.timeline.epoch &&
+        (mode != AO_MEDIA_CREDIT || isfinite(ceiling)) &&
+        isfinite(played_wall) && isfinite(released_media);
+    if (valid) {
+        p->media.mode = mode;
+        p->media.ceiling = ceiling;
+        mp_media_timeline_release(&p->media.timeline, epoch, played_wall, released_media);
+    }
+    mp_mutex_unlock(&p->lock);
+    return valid;
+}
+
+void ao_media_gate_snapshot(struct ao *ao, struct ao_media_gate_snapshot *snapshot)
+{
+    struct buffer_state *p = ao->buffer_state;
+    mp_mutex_lock(&p->lock);
+    *snapshot = p->media;
+    mp_mutex_unlock(&p->lock);
+}
+
 // Special behavior with data==NULL: caller uses p->pending.
 static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
-                       bool pad_silence)
+                       bool pad_silence, int64_t out_time_ns, bool *held)
 {
     struct buffer_state *p = ao->buffer_state;
     int pos = 0;
+    double wall_cursor = 0;
     *eof = false;
 
+    bool gated = p->media.mode != AO_MEDIA_DISABLED;
     while (p->playing && !p->paused && pos < samples) {
+        if (gated) {
+            if (p->media.mode != AO_MEDIA_CLOSED && (!p->media_generation ||
+                atomic_load((_Atomic uint64_t *)p->media_generation->data) !=
+                    p->media_frame_generation)) {
+                p->media.mode = AO_MEDIA_CLOSED;
+                p->media.last_invalid_reason = "generation-stale";
+                p->media.invalid_copies++;
+            }
+            if (p->media.mode == AO_MEDIA_CLOSED) {
+                *held = true;
+                break;
+            }
+        }
         if (!p->pending || !mp_aframe_get_size(p->pending)) {
             TA_FREEP(&p->pending);
             struct mp_frame frame = mp_pin_out_read(p->input->pins[0]);
             if (!frame.type)
                 break; // we can't/don't want to block
             if (frame.type != MP_FRAME_AUDIO) {
-                if (frame.type == MP_FRAME_EOF)
+                if (frame.type == MP_FRAME_EOF) {
                     *eof = true;
+                    if (gated)
+                        p->media.input_eof = true;
+                }
                 mp_frame_unref(&frame);
                 continue;
             }
@@ -144,6 +218,57 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
         int copy = mp_aframe_get_size(p->pending);
         uint8_t **fdata = mp_aframe_get_data_ro(p->pending);
         copy = MPMIN(copy, samples - pos);
+        if (gated) {
+            struct mp_media_copy source = {
+                .available = copy,
+                .effective_rate = mp_aframe_get_effective_rate(p->pending),
+                .output_rate = ao->samplerate,
+                .media_start = mp_aframe_get_pts(p->pending),
+                .wall_start = pos ? wall_cursor : MP_TIME_NS_TO_S(out_time_ns) -
+                              samples / (double)ao->samplerate,
+            };
+            double ceiling = p->media.mode == AO_MEDIA_TERMINAL ?
+                DBL_MAX : p->media.ceiling;
+            struct mp_media_admission admission = {.status = MP_MEDIA_INVALID};
+            if (source.media_start != MP_NOPTS_VALUE) {
+                admission = mp_media_gate_admit(&p->media.timeline,
+                    p->media.timeline.epoch, source, ceiling,
+                    MP_TIME_NS_TO_S(out_time_ns), samples, pos, &wall_cursor);
+            }
+            if (admission.status != MP_MEDIA_ADMITTED) {
+                *held = true;
+                p->media.refused_copies++;
+                p->media.invalid_copies += admission.status == MP_MEDIA_INVALID;
+                if (admission.status == MP_MEDIA_INVALID) {
+                    struct mp_media_timeline *t = &p->media.timeline;
+                    double media_end = t->retired_media_end;
+                    double wall_end = t->retired_wall_end;
+                    if (t->count) {
+                        struct mp_media_segment *last = &t->segments[
+                            (t->head + t->count - 1) % MP_MEDIA_TIMELINE_CAPACITY];
+                        media_end = last->media_end;
+                        wall_end = last->wall_end;
+                    }
+                    p->media.last_invalid_reason = source.media_start == MP_NOPTS_VALUE ?
+                        "missing-pts" : source.wall_start < wall_end ?
+                        "wall-overlap" : source.media_start < media_end ?
+                        "media-overlap" : "invalid-numeric";
+                    p->media.invalid_media_start = source.media_start;
+                    p->media.invalid_wall_start = source.wall_start;
+                    p->media.prior_media_end = media_end;
+                    p->media.prior_wall_end = wall_end;
+                    p->media.invalid_callback_samples = samples;
+                    p->media.invalid_copy_offset = pos;
+                }
+                p->media.full_refusals += admission.status == MP_MEDIA_FULL;
+                break;
+            }
+            copy = admission.samples;
+            p->media.admitted_samples += copy;
+            p->media.admitted_segments++;
+            p->media.segments_peak = MPMAX(p->media.segments_peak,
+                                           p->media.timeline.count);
+        }
         for (int n = 0; n < ao->num_planes; n++) {
             memcpy((char *)data[n] + pos * ao->sstride,
                    fdata[n], copy * ao->sstride);
@@ -181,12 +306,25 @@ static int ao_read_data_locked(struct ao *ao, void **data, int samples,
     struct buffer_state *p = ao->buffer_state;
     mp_assert(!ao->driver->write);
 
-    int pos = read_buffer(ao, data, samples, eof, pad_silence);
+    bool held = false;
+    bool gated = p->media.mode != AO_MEDIA_DISABLED;
+    if (gated) {
+        p->media.slot_end = MP_TIME_NS_TO_S(out_time_ns);
+        p->media.slot_start = p->media.slot_end - samples / (double)ao->samplerate;
+    }
+    int pos = read_buffer(ao, data, samples, eof, pad_silence, out_time_ns, &held);
+    if (gated) {
+        p->media.silent_callbacks += pos == 0;
+        p->media.source_starvation_callbacks += pos < samples && !held &&
+            !p->media.input_eof && p->playing && !p->paused;
+        // Even a wholly silent callback can unblock a pending core mapping.
+        ao->wakeup_cb(ao->wakeup_ctx);
+    }
 
     if (pos > 0)
         p->end_time_ns = out_time_ns;
 
-    if (pos < samples && p->playing && !p->paused) {
+    if (pos < samples && p->playing && !p->paused && !held && !gated) {
         p->playing = false;
         ao->wakeup_cb(ao->wakeup_ctx);
         // For ao_drain().
@@ -361,6 +499,9 @@ void ao_reset(struct ao *ao)
     p->recover_pause = false;
     p->hw_paused = false;
     p->end_time_ns = 0;
+    p->media.mode = AO_MEDIA_DISABLED;
+    av_buffer_unref(&p->media_generation);
+    mp_media_timeline_reset(&p->media.timeline, p->media.timeline.epoch + 1);
 
     mp_mutex_unlock(&p->lock);
 
@@ -541,6 +682,8 @@ void ao_uninit(struct ao *ao)
         ao->driver->uninit(ao);
 
     if (p) {
+        // The driver has stopped all callbacks before releasing its token.
+        av_buffer_unref(&p->media_generation);
         talloc_free(p->filter_root);
         talloc_free(p->queue);
         talloc_free(p->pending);
@@ -660,7 +803,7 @@ static bool ao_play_data(struct ao *ao)
     bool got_eof = false;
     if (ao->driver->write_frames) {
         TA_FREEP(&p->pending);
-        samples = read_buffer(ao, NULL, 1, &got_eof, false);
+        samples = read_buffer(ao, NULL, 1, &got_eof, false, 0, NULL);
         planes = (void **)&p->pending;
     } else {
         if (!realloc_buf(ao, space)) {
@@ -677,7 +820,7 @@ static bool ao_play_data(struct ao *ao)
         }
 
         if (!samples) {
-            samples = read_buffer(ao, planes, space, &got_eof, true);
+            samples = read_buffer(ao, planes, space, &got_eof, true, 0, NULL);
             if (p->paused || (ao->stream_silence && !p->playing))
                 samples = space; // read_buffer() sets remainder to silent
         }

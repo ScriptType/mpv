@@ -24,6 +24,7 @@
 #include "common/common.h"
 #include "audio/chmap.h"
 #include "audio/chmap_sel.h"
+#include "audio/out/media_timeline.h"
 
 enum aocontrol {
     // _VOLUME commands take a pointer to float for input/output.
@@ -98,6 +99,34 @@ void ao_set_gain(struct ao *ao, float gain);
 double ao_get_delay(struct ao *ao);
 // Estimated pull clock advancement after a reset-based pause, or -1 if unknown.
 double ao_get_pause_clock_tail(struct ao *ao);
+
+enum ao_media_gate_mode {
+    AO_MEDIA_DISABLED, AO_MEDIA_CLOSED, AO_MEDIA_CREDIT, AO_MEDIA_TERMINAL,
+};
+
+struct ao_media_gate_snapshot {
+    enum ao_media_gate_mode mode;
+    struct mp_media_timeline timeline;
+    double ceiling, slot_start, slot_end;
+    bool input_eof;
+    uint64_t admitted_samples, admitted_segments, silent_callbacks;
+    uint64_t source_starvation_callbacks;
+    uint64_t refused_copies, invalid_copies, full_refusals;
+    unsigned segments_peak;
+    const char *last_invalid_reason;
+    double invalid_media_start, invalid_wall_start, prior_media_end, prior_wall_end;
+    int invalid_callback_samples, invalid_copy_offset;
+};
+
+// begin runs before ao_start; control and snapshot serialize with actual copies.
+struct AVBufferRef;
+bool ao_media_gate_begin(struct ao *ao, uint64_t epoch,
+                         struct AVBufferRef *generation, uint64_t frame_generation);
+bool ao_media_gate_control(struct ao *ao, uint64_t epoch,
+                           enum ao_media_gate_mode mode, double ceiling,
+                           double played_wall, double released_media);
+void ao_media_gate_snapshot(struct ao *ao, struct ao_media_gate_snapshot *snapshot);
+
 void ao_reset(struct ao *ao);
 void ao_start(struct ao *ao);
 void ao_set_paused(struct ao *ao, bool paused, bool eof);

@@ -22,6 +22,7 @@
 #include <stdbool.h>
 
 #include "audio/aframe.h"
+#include "audio/out/ao.h"
 #include "clipboard/clipboard.h"
 #include "common/common.h"
 #include "filters/f_output_chain.h"
@@ -35,6 +36,28 @@
 #include "demux/stheader.h"
 
 // definitions used internally by the core player code
+
+struct adaptive_media_credit {
+    struct mp_image *image;
+    double end;
+    bool scheduled;
+};
+
+struct adaptive_media_gate {
+    bool requested, active, terminal, has_credit, contract_failed;
+    const char *status, *failure_reason;
+    struct ao_media_gate_snapshot stopped_audio;
+    unsigned failure_credits;
+    bool failure_scheduled_valid;
+    double failure_audio_pts, failure_video_pts, failure_avsync;
+    double configured_audio_delay;
+    uint64_t epoch, generation, scheduled_epoch;
+    struct adaptive_media_credit credits[2];
+    unsigned count, peak;
+    double released_media, credit_end;
+    uint64_t mapping_waits, scheduled_frames, late_frames, schedule_failures;
+    double mapped_wall, target_wall, lateness, max_lateness;
+};
 
 enum stop_play_reason {
     KEEP_PLAYING = 0,   // playback of a file is actually going on
@@ -438,6 +461,7 @@ typedef struct MPContext {
 
     bool paused_for_cache;
     bool paused_for_enhancement;
+    struct adaptive_media_gate media_gate;
     uint64_t enhancement_revision, enhancement_buffer_count;
     double enhancement_buffer_start, enhancement_buffer_seconds;
     bool demux_underrun;
@@ -529,6 +553,10 @@ float audio_get_gain(struct MPContext *mpctx);
 void audio_update_volume(struct MPContext *mpctx);
 void reload_audio_output(struct MPContext *mpctx);
 void audio_start_ao(struct MPContext *mpctx);
+void adaptive_media_gate_reset(struct MPContext *mpctx, const char *reason);
+void adaptive_media_gate_fail(struct MPContext *mpctx, const char *reason);
+void adaptive_media_gate_update(struct MPContext *mpctx);
+bool adaptive_media_gate_start(struct MPContext *mpctx);
 
 // configfiles.c
 void mp_parse_cfgfiles(struct MPContext *mpctx);

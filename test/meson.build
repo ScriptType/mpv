@@ -111,6 +111,10 @@ audio_media_timeline = executable('audio-media-timeline', 'audio_media_timeline.
     include_directories: incdir, dependencies: libm)
 test('audio-media-timeline', audio_media_timeline)
 
+adaptive_media_gate = executable('adaptive-media-gate', 'adaptive_media_gate.c',
+    include_directories: incdir, dependencies: libm)
+test('adaptive-media-gate', adaptive_media_gate)
+
 json = executable('json', 'json.c', include_directories: [incdir, incdir_public], link_with: test_utils)
 test('json', json)
 
