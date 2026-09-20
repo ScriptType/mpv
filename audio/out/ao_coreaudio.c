@@ -324,11 +324,11 @@ static bool init_audiounit(struct ao *ao, AudioStreamBasicDescription asbd, Audi
                      "can't link audio unit to selected device");
 
     err = AudioUnitSetProperty(p->audio_unit,
-                               kAudioOutputUnitProperty_ChannelMap,
-                               kAudioUnitScope_Global, 0, layout, layout_size);
+                               kAudioUnitProperty_AudioChannelLayout,
+                               kAudioUnitScope_Input, 0, layout, layout_size);
 
     CHECK_CA_ERROR_L(coreaudio_error_audiounit,
-                     "unable to set the input channel layout on the audio unit");
+                     "unable to set input audio channel layout on audio unit");
 
     AURenderCallbackStruct render_cb = (AURenderCallbackStruct) {
         .inputProc       = render_cb_lpcm,
