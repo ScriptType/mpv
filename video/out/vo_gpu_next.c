@@ -1743,8 +1743,7 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
             update_hook_opts_dynamic(p, p->hooks[i], frame->current);
     }
 
-    // A seek may cancel a generation while this renderer prepares its passes.
-    // Check every contributing image again immediately before GPU submission.
+    // A seek can cancel a generation while the passes above are prepared.
     for (int i = 0; i < mix.num_frames; i++) {
         if (!mp_image_is_current(mix.frames[i]->user_data)) {
             p->want_reset = true;
@@ -1934,9 +1933,8 @@ static void video_screenshot(struct vo *vo, struct voctrl_screenshot *args)
         .pts = p->last_pts,
         .drift_compensation = 0,
     );
-    // A retained seek replacement can refill the queue before swapchain
-    // reconfiguration lets draw_frame update last_pts. Match draw_frame's
-    // first-frame clamp instead of querying before the queue's oldest PTS.
+    // A seek replacement can refill the queue before draw_frame updates
+    // last_pts. Apply draw_frame's first-frame clamp here too.
     struct pl_source_frame first;
     if (pl_queue_peek(p->queue, 0, &first) && qparams.pts < first.pts)
         qparams.pts = first.pts;

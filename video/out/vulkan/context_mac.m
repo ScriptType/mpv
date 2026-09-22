@@ -72,9 +72,8 @@ static int mac_vk_color_depth(struct ra_ctx *ctx)
 
 static void mac_vk_clear_linear_metadata(struct priv *p)
 {
-    // Layer access is supported on the rendering thread. Explicitly commit on
-    // this thread (which has no Core Animation run loop), without a main-queue
-    // round trip. Never hold this transaction lock while calling Vulkan.
+    // The VO thread has no Core Animation run loop, so commit explicitly.
+    // Never hold this transaction lock while calling Vulkan.
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     [CATransaction lock];
@@ -97,17 +96,15 @@ static bool mac_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
         params->repr.levels == PL_COLOR_LEVELS_FULL;
 
     if (!linear_bt2020) {
-        // Remove our optical units before Vulkan resumes PQ/HLG ownership.
-        // Also remove stale PQ metadata on an SDR transition: MoltenVK's SDR
-        // branch, like its linear branch, does not clear that metadata.
+        // MoltenVK's SDR and linear branches never clear EDR metadata, so drop
+        // ours (or stale PQ metadata) before Vulkan resumes ownership.
         if (p->linear_hdr_active || !params || !pl_color_space_is_hdr(&params->color))
             mac_vk_clear_linear_metadata(p);
         return false;
     }
 
-    // Keep Vulkan's normal BT.2020-linear surface/format selection. Returning
-    // external parameters preserves the source HDR range, which libplacebo's
-    // transfer-only HDR metadata gate otherwise discards for a linear target.
+    // libplacebo's transfer-only HDR metadata gate drops the source HDR range
+    // for a linear target. Returning external parameters keeps it.
     pl_color_space_infer(&params->color);
     float minimum = params->color.hdr.min_luma;
     float maximum = params->color.hdr.max_luma;
@@ -115,11 +112,9 @@ static bool mac_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
         return false;
     pl_swapchain_colorspace_hint(p->vk.swapchain, &params->color);
 
-    // Complete any pending colour/format recreation BEFORE writing metadata.
-    // Zero dimensions preserve the current size. An unchanged swapchain only
-    // takes libplacebo's mutex; recreation creates image wrappers but does not
-    // acquire a drawable. Apple's edrMetadata contract requires assignment
-    // before nextDrawable, which happens later in pl_swapchain_start_frame.
+    // Apple requires EDRMetadata before nextDrawable, which happens later in
+    // pl_swapchain_start_frame. Zero dimensions keep the size and finish any
+    // pending recreation without acquiring a drawable.
     int width = 0, height = 0;
     if (!pl_swapchain_resize(p->vk.swapchain, &width, &height) || width < 1 || height < 1)
         return false;
@@ -236,7 +231,7 @@ static bool resize(struct ra_ctx *ctx)
 
     CGSize size = p->vo_mac.surfaceSize;
     if (size.width < 1 || size.height < 1)
-        return true; // A hidden/temporarily detached host retains its last swapchain.
+        return true; // a hidden or detached host keeps its last swapchain
 
     return ra_vk_ctx_resize(ctx, (int)size.width, (int)size.height);
 }

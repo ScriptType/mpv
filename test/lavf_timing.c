@@ -62,7 +62,7 @@ int main(void)
     double precise = 1.0 / 6;
     check("fractional zero-origin duration", format, precise, 0, precise);
     if (mp_lavf_resolve_timing(format, precise).duration != precise)
-        abort(); // preserve the exact existing Double, not only a tolerance
+        abort();
     video->duration = 166668; video->time_base = AV_TIME_BASE_Q;
     check("endpoint beyond enclosing microsecond", format, precise, 0, 0.166668);
     video->time_base = (AVRational){1, 1};

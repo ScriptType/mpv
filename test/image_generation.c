@@ -43,8 +43,6 @@ int main(void)
     assert_true(enhanced_variant->async_content_kind == 2);
     assert_true(mp_image_same_async_identity(source_variant, enhanced_variant));
     talloc_free(original);
-    // Source destruction cannot invalidate a retained descriptor. A seek updates
-    // one shared atomic state, cancelling queued copies without freeing pixels.
     assert_true(mp_image_is_current(retained));
     atomic_store((_Atomic uint64_t *)generation->data, 8);
     assert_false(mp_image_is_current(retained));
@@ -58,7 +56,6 @@ int main(void)
     talloc_free(source_variant);
     talloc_free(enhanced_variant);
 
-    // Equivalent rational timestamps compare exactly across distinct scales.
     generation = av_buffer_allocz(sizeof(_Atomic uint64_t));
     atomic_init((_Atomic uint64_t *)generation->data, 1);
     struct mp_image a = {.async_generation = generation, .async_frame_generation = 1,

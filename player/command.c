@@ -1714,8 +1714,6 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         &mpctx->vo_chain->filter->async_video : &empty;
     struct mpv_node *r = arg;
     node_init(r, MPV_FORMAT_NODE_MAP, NULL);
-    // One core-thread snapshot. The scheduled tuple is cached at a video
-    // scheduling update; it is not a fresh physical A/V measurement.
     node_map_add_string(r, "audio-status", mp_status_str(mpctx->audio_status));
     node_map_add_string(r, "video-status", mp_status_str(mpctx->video_status));
     bool audio_clock_active = audio_is_clock_active(mpctx);
@@ -1726,8 +1724,7 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
         node_map_add_double(r, "audio-pts-seconds", audio_pts);
     else
         node_map_add(r, "audio-pts-seconds", MPV_FORMAT_NONE);
-    // AO exhaustion can happen without another video scheduling update. Mask
-    // the cached tuple once its current clock domain is no longer active.
+    // The AO can run dry without another video scheduling update.
     bool scheduled_valid = mpctx->last_av_difference_valid && audio_pts_valid &&
         mpctx->video_status == STATUS_PLAYING;
     node_map_add_flag(r, "scheduled-avsync-valid", scheduled_valid);
@@ -1763,8 +1760,7 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     node_map_add_string(r, "model", s->model ? s->model : "original");
     node_map_add_string(r, "hardware", s->hardware ? s->hardware : "unavailable");
     if (s->prepared_json) {
-        // json_parse unescapes strings in place; preserve the cached snapshot
-        // for subsequent property readers.
+        // json_parse modifies its input in place.
         char *json = talloc_strdup(r->u.list, s->prepared_json);
         struct mpv_node *prepared = node_map_add(r, "prepared", MPV_FORMAT_NONE);
         if (json_parse(r->u.list, prepared, &json, MAX_JSON_DEPTH) < 0)
@@ -1783,8 +1779,6 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     node_map_add_flag(r, "compare-ready", current && current->async_pair &&
                       mp_image_is_current(current) && mpctx->opts->pause);
     node_map_add_string(r, "comparison", current && current->async_original ? "original" : "enhanced");
-    // Original/Dolby Vision output also carries decoder-native rational timing.
-    // An enhancement generation is independent of source timestamp validity.
     if (current && current->source_pts != AV_NOPTS_VALUE &&
         current->source_timebase_num > 0 && current->source_timebase_den > 0) {
         node_map_add_int64(r, "displayed-source-pts", current->source_pts);

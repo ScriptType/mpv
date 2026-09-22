@@ -105,7 +105,6 @@ static void clear_av_diff(struct MPContext *mpctx)
     mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;
 }
 
-// Hold or release both playback clocks while an enhanced frame is pending.
 static void set_enhancement_pause(struct MPContext *mpctx, bool paused)
 {
     if (mpctx->paused_for_enhancement == paused)
@@ -474,9 +473,7 @@ static bool use_video_lookahead(struct MPContext *mpctx)
 
 static int get_req_frames(struct MPContext *mpctx, bool eof)
 {
-    // Async policy uses packet duration and bounds lookahead independently of
-    // renderer interpolation. In particular, a seek preview never waits for a
-    // second enhanced frame before it can be shown.
+    // A seek preview must not wait for a second enhanced frame.
     if (mpctx->vo_chain && mpctx->vo_chain->filter->async_video.active)
         return 1;
     // On EOF, drain all frames.
@@ -1137,8 +1134,6 @@ void write_video(struct MPContext *mpctx)
         mp_client_property_change(mpctx, "enhancement-state");
     }
 
-    // A preview is shown while both clocks remain held until its matching
-    // enhanced result is ready. User pause remains a separate state.
     bool preview_wait = async->active && async->waiting_preview && vo_has_frame(vo);
     bool keep_buffering = preview_wait ||
         (async->adaptive && mpctx->paused_for_enhancement);
@@ -1179,9 +1174,8 @@ void write_video(struct MPContext *mpctx)
             bool wait_for_video = vo_still_displaying(vo);
             if (async->adaptive && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
                 !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
-                // The CoreAudio pull clock keeps advancing after a reset-based
-                // pause, so pause that tail ahead of the video deadline. AOs
-                // without a known tail keep the ordinary VO deadline.
+                // CoreAudio's pull clock keeps advancing after a reset-based
+                // pause, so pause that tail ahead of the video deadline.
                 int64_t frame_end = vo_get_last_frame_end(vo);
                 double tail = ao_get_pause_clock_tail(mpctx->ao);
                 if (frame_end > 0 && tail >= 0) {
@@ -1348,10 +1342,8 @@ void write_video(struct MPContext *mpctx)
         mp_mutex_unlock(&vo->params_mutex);
     }
 
-    // A completed enhancement may still need a VO reconfiguration or subtitle
-    // packets. Keep the shared clock held until those dependencies and the VO
-    // queue are ready; resuming at VD_NEW_FRAME would let audio advance across
-    // the early returns above and below without a replacement video frame.
+    // Resume held clocks only once subtitles and the VO are ready. Otherwise
+    // audio advances across the early returns without a new video frame.
     osd_set_force_video_pts(mpctx->osd, MP_NOPTS_VALUE);
     if (!update_subtitles(mpctx, mpctx->next_frames[0]->pts)) {
         MP_VERBOSE(mpctx, "Video frame delayed due to waiting on subtitles.\n");

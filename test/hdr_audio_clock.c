@@ -28,7 +28,6 @@ static void ordinary_gapless_is_unchanged(void)
     };
     CHECK(!mp_hdr_audio_clock_active(s));
     CHECK(mp_hdr_audio_drain_before_pause(s));
-    // A pause flag alone must not bypass ordinary gapless draining.
     s.enhancement_hold = true;
     CHECK(mp_hdr_audio_drain_before_pause(s));
 }
@@ -39,7 +38,6 @@ static void queued_draining_and_eof_audio_remain_clock_active(void)
         struct mp_hdr_audio_clock_state s = enhancement_tail(eof);
         CHECK(mp_hdr_audio_clock_active(s));
         CHECK(mp_hdr_audio_drain_before_pause(s) == (bool)eof);
-        // AO-playing includes a logically paused queue; retain that clock.
         s.enhancement_hold = true;
         CHECK(mp_hdr_audio_clock_active(s));
         CHECK(!mp_hdr_audio_drain_before_pause(s));
@@ -49,11 +47,11 @@ static void queued_draining_and_eof_audio_remain_clock_active(void)
 static void only_the_actual_enhancement_hold_skips_draining(void)
 {
     struct mp_hdr_audio_clock_state s = enhancement_tail(true);
-    CHECK(mp_hdr_audio_drain_before_pause(s)); // user/cache pause
+    CHECK(mp_hdr_audio_drain_before_pause(s));
     s.enhancement_hold = true;
     CHECK(!mp_hdr_audio_drain_before_pause(s));
     s.enhancement_hold = false;
-    CHECK(mp_hdr_audio_drain_before_pause(s)); // ordinary semantics restored
+    CHECK(mp_hdr_audio_drain_before_pause(s));
 }
 
 static void stopped_ao_does_not_extend_the_clock(void)
@@ -63,7 +61,6 @@ static void stopped_ao_does_not_extend_the_clock(void)
     s.ao_playing = false;
     CHECK(!mp_hdr_audio_clock_active(s));
     CHECK(mp_hdr_audio_drain_before_pause(s));
-    // ao_set_paused itself will not drain an AO that is no longer playing.
 }
 
 static void late_enhancement_activation_handles_already_logical_eof(void)
@@ -76,19 +73,18 @@ static void late_enhancement_activation_handles_already_logical_eof(void)
     s.timed_enhancement_video = true;
     CHECK(mp_hdr_audio_clock_active(s));
     CHECK(!mp_hdr_audio_drain_before_pause(s));
-    // No new PLAYING -> DRAINING transition was required.
 }
 
 static void inactive_video_or_audio_cannot_borrow_a_previous_clock(void)
 {
     struct mp_hdr_audio_clock_state s = enhancement_tail(true);
     s.enhancement_hold = true;
-    s.timed_enhancement_video = false; // bypass/Direct/no-AO/untimed/video EOF
+    s.timed_enhancement_video = false;
     CHECK(!mp_hdr_audio_clock_active(s));
     CHECK(mp_hdr_audio_drain_before_pause(s));
     s = (struct mp_hdr_audio_clock_state){
         .timed_enhancement_video = true, .ao_playing = true,
-    }; // audio still syncing/ready, not current playing or draining data
+    };
     CHECK(!mp_hdr_audio_clock_active(s));
     CHECK(!mp_hdr_audio_drain_before_pause(s));
 }

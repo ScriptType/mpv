@@ -117,7 +117,7 @@ struct mpv_handle {
     struct MPContext *mpctx;
     struct mp_client_api *clients;
     int64_t id;
-    struct mpv_hdr_export *hdr_export; // serialized native exporter owner
+    struct mpv_hdr_export *hdr_export;
 
     // -- not thread-safe
     struct mpv_event *cur_event;

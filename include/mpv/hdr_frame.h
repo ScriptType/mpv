@@ -40,7 +40,7 @@ typedef struct {
     uint64_t host_ticks, clock_sample_span_ticks;
     double media_seconds, rate;
     // 1=playing_audio_pts sampled against host_ticks, 2=paused selected frame.
-    // A progressing video-only timeline is initially unsupported.
+    // A progressing video-only timeline is unsupported.
     uint32_t clock_source, reserved;
 } mpv_hdr_snapshot;
 
@@ -57,7 +57,7 @@ typedef struct {
 } mpv_hdr_frame_descriptor;
 
 // Optional symbols: resolve at runtime. One active exporter per core, at most
-// three outstanding leases across its exporters; max_leases must be1...3.
+// three outstanding leases across its exporters; max_leases must be 1...3.
 // Call open/poll/close on the native client worker, never the AppKit/VO thread.
 // Poll briefly synchronizes with the core; it never waits for inference/GPU.
 MPV_EXPORT mpv_hdr_status mpv_hdr_export_open(mpv_handle *client,
@@ -83,7 +83,7 @@ MPV_EXPORT void mpv_hdr_export_close(mpv_hdr_export *exporter);
 // generation checks and never recycle/mutate surfaces while the renderer owns
 // them. The producer's six-buffer pool can stall until those references drain.
 // Subtitles, raw Dolby Vision, nontrivial crop/rotation/PAR and nonfloat source
-// previews are explicitly unsupported by this initial pre-composition export.
+// previews are unsupported by this pre-composition export.
 
 #ifdef __cplusplus
 }

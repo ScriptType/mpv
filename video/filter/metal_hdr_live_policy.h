@@ -1,6 +1,4 @@
-/* Private completed-work qualification for the Metal HDR filter.
- * License: LGPL-2.1-or-later
- */
+/* License: LGPL-2.1-or-later */
 #ifndef MPV_METAL_HDR_LIVE_POLICY_H
 #define MPV_METAL_HDR_LIVE_POLICY_H
 
@@ -38,8 +36,6 @@ static inline void mp_hdr_live_init(struct mp_hdr_live_policy *p, bool adaptive)
     };
 }
 
-// Seek/bypass/geometry resets discard timing evidence. A replacement filter
-// uses init instead, so model/settings/device evidence cannot cross sessions.
 static inline void mp_hdr_live_invalidate(struct mp_hdr_live_policy *p)
 {
     p->epoch++;
@@ -56,8 +52,6 @@ static inline bool mp_hdr_live_valid_fps(double fps)
     return isfinite(fps) && fps > 0 && isfinite(.8 / fps);
 }
 
-// This epoch affects qualification only, never engine temporal history. Each
-// admission retains it, excluding old pending work even across FPS A-B-A.
 static inline bool mp_hdr_live_observe_fps(struct mp_hdr_live_policy *p, double fps)
 {
     if (!mp_hdr_live_valid_fps(fps))
@@ -92,8 +86,6 @@ static inline void mp_hdr_live_record(struct mp_hdr_live_policy *p,
                                        struct mp_hdr_live_settings s,
                                        uint64_t epoch, double seconds)
 {
-    // Rejected stale completions consume neither cold nor warmed samples and
-    // cannot invalidate newer evidence, even if their old timing is malformed.
     if (epoch != p->epoch)
         return;
     if (!isfinite(seconds) || seconds <= 0 ||
@@ -121,8 +113,6 @@ static inline void mp_hdr_live_record(struct mp_hdr_live_policy *p,
         p->mode = MP_HDR_ADAPTIVE;
 }
 
-// Qualification does not enter Live automatically; the existing user command
-// must request it. Direct/Adaptive remain available without qualification.
 static inline bool mp_hdr_live_request(struct mp_hdr_live_policy *p,
                                         struct mp_hdr_live_settings s,
                                         enum mp_hdr_live_mode mode)

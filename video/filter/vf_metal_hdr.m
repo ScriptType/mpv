@@ -1,5 +1,4 @@
 /*
- * Asynchronous VideoToolbox -> shared HDR engine -> native float import.
  * This file is part of mpv, licensed under LGPL 2.1 or later.
  */
 #import <CoreVideo/CoreVideo.h>
@@ -41,7 +40,7 @@ struct hdr_options {
     int processing_width, processing_height;
     double strength, colour_strength, reference_white, hlg_peak, maximum_luminance_ratio;
     bool bypass;
-    int policy; // 0 direct, 1 Adaptive; Live requires runtime qualification
+    int policy;
 };
 
 struct hdr_result {
@@ -81,7 +80,7 @@ struct priv {
     char error[512];
     struct hdr_result results[HDR_SLOTS];
     int result_count;
-    int active_work; // protected by lock; idle workers sleep without polling
+    int active_work; // protected by lock
     struct hdr_pending pending[HDR_SLOTS];
     int pending_count;
     struct mp_frame held_input;
@@ -201,8 +200,8 @@ static void fail_worker(struct mp_filter *f, const char *message)
     mp_filter_wakeup(f);
 }
 
-// A single pass converts absolute nits into libplacebo's 1.0=203-nit linear
-// domain without clipping, and computes output peak luminance per threadgroup.
+// Converts absolute nits to libplacebo's 1.0 = 203 nit linear domain without
+// clipping, and reduces peak luminance per threadgroup.
 static NSString *normalization_shader = @
     "#include <metal_stdlib>\n"
     "using namespace metal;\n"
@@ -221,8 +220,7 @@ static NSString *normalization_shader = @
     "if(tid==0)atomic_fetch_max_explicit(peak,as_type<uint>(lum[0]),memory_order_relaxed);"
     "}";
 
-// 0 means pool backpressure, 1 enqueued, -1 failure. All allocations are bounded
-// by six downstream pixel buffers plus the engine's three admitted frame slots.
+// Returns 0 on pool backpressure, 1 when enqueued, -1 on failure.
 static int start_normalization(struct priv *p, struct hdr_gpu_job *job)
 {
     int width = job->frame.geometry.width, height = job->frame.geometry.height;
@@ -246,7 +244,6 @@ static int start_normalization(struct priv *p, struct hdr_gpu_job *job)
         return 0;
     if (result != kCVReturnSuccess)
         return -1;
-    // Immutable publication metadata shared by gpu-next and optional AVKit.
     CVBufferSetAttachment(job->buffer, kCVImageBufferColorPrimariesKey,
                           kCVImageBufferColorPrimaries_ITU_R_2020, kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(job->buffer, kCVImageBufferTransferFunctionKey,
@@ -408,9 +405,9 @@ static void reset(struct mp_filter *f)
     MP_VERBOSE(f, "HDR generation reset to %llu\n", (unsigned long long)generation);
 }
 
-// Dolby Vision code values must reach gpu-next's metadata-driven decode before
-// any linear-light neural operation. This filter does not implement that decode.
-// Never strip RPU/FEL metadata or reinterpret an incompatible base layer as PQ.
+// Dolby Vision needs gpu-next's RPU-driven decode before any linear-light
+// processing, and this filter has none. Never strip RPU/FEL metadata or
+// reinterpret an incompatible base layer as PQ.
 static int native_dovi_path(struct mp_filter *f, struct mp_image *image)
 {
     struct priv *p = f->priv;
@@ -492,7 +489,7 @@ static bool source_colour(struct mp_image *image, fe_colour *colour,
     case PL_COLOR_SYSTEM_BT_709: colour->matrix = FE_YUV709; break;
     case PL_COLOR_SYSTEM_BT_601: colour->matrix = FE_YUV601; break;
     case PL_COLOR_SYSTEM_RGB: colour->matrix = FE_RGB; break;
-    default: return false; // Dolby Vision reshaping is not generic PQ conversion.
+    default: return false;
     }
     colour->range = params->repr.levels == PL_COLOR_LEVELS_FULL ? FE_FULL_RANGE : FE_VIDEO_RANGE;
     switch (params->chroma_location) {
@@ -529,7 +526,6 @@ bool mp_hdr_frame_descriptor(struct mp_image *image, fe_frame *frame,
     }
     AVRational timebase = {image->source_timebase_num, image->source_timebase_den};
     double exact_pts = image->source_pts * av_q2d(timebase);
-    // Filters that changed timeline semantics must provide a new rational identity.
     if (fabs(exact_pts - image->pts) > 1e-9) {
         snprintf(error, capacity, "Decoder/source timeline differs: rational=%.12f playback=%.12f", exact_pts, image->pts);
         return false;
@@ -544,9 +540,8 @@ bool mp_hdr_frame_descriptor(struct mp_image *image, fe_frame *frame,
             return false;
         frame_duration = (fe_time){duration, timebase.den};
     } else {
-        // A container's PTS scale need not represent the nominal frame duration
-        // (e.g. 30 fps Matroska with millisecond PTS). Duration has its own exact
-        // rational denominator; never round it into the container PTS timebase.
+        // Container PTS timebases can be coarser than the frame duration (30 fps
+        // Matroska uses millisecond PTS), so the duration keeps its own denominator.
         double seconds = image->pkt_duration > 0 ? image->pkt_duration :
                          image->nominal_fps > 0 ? 1 / image->nominal_fps : 0;
         AVRational duration = av_d2q(seconds, INT32_MAX);
@@ -669,8 +664,8 @@ static void process(struct mp_filter *f)
             struct mp_image *image = mp_image_new_custom_ref(&template, output.buffer, release_pixel_buffer);
             output.buffer = NULL;
             mp_image_copy_attributes(image, pending.image);
-            // ICC, dynamic metadata and film grain describe the unprocessed source.
-            // Applying them again would reinterpret or modify the reconstructed RGB.
+            // ICC, dynamic metadata and film grain describe the source, not
+            // the reconstructed RGB.
             av_buffer_unref(&image->icc_profile);
             av_buffer_unref(&image->dovi);
             av_buffer_unref(&image->film_grain);
@@ -725,7 +720,6 @@ static void process(struct mp_filter *f)
             if (pending.preview && p->state) {
                 mp_image_unrefp(&p->state->replacement);
                 p->state->replacement = image;
-                // Core clears waiting_preview only after same-PTS VO replacement.
                 mp_filter_wakeup(f);
             } else {
                 mp_pin_in_write(f->ppins[1], MAKE_FRAME(MP_FRAME_VIDEO, image));
@@ -774,9 +768,8 @@ static void process(struct mp_filter *f)
         live_policy_updated(f, was_live);
     int dovi_path = native_dovi_path(f, image);
     if (dovi_path < 0) {
-        // A failed user filter is automatically removed by mpv, which would
-        // present these same uninterpretable code values. End video instead.
-        // The diagnostic/capability reason remains available to the host.
+        // mpv removes a failed user filter and would then present these
+        // uninterpretable code values, so end video instead.
         mp_frame_unref(&p->held_input);
         p->interpretation_rejected = true;
         mp_pin_in_write(f->ppins[1], MP_EOF_FRAME);
@@ -787,8 +780,8 @@ static void process(struct mp_filter *f)
         p->held_input = MP_NO_FRAME;
         return;
     }
-    // Preroll decoder frames reach mpv's accurate-seek selector immediately.
-    // They do not occupy inference slots or mutate temporal model history.
+    // Seek preroll goes straight to mpv's accurate-seek selector, without an
+    // inference slot or temporal model history.
     if (p->need_preview && p->state && p->state->seeking &&
         image->pts < p->state->seek_target) {
         mp_pin_in_write(f->ppins[1], p->held_input);
@@ -933,8 +926,6 @@ static void destroy(struct mp_filter *f)
         mp_thread_join(p->thread);
     if (p->session) {
         // Process/dylib teardown must not race MLX's global Metal destruction.
-        // Admission and queued generations are already cancelled; only genuinely
-        // running work remains. This occurs on mpv's core thread, not AppKit.
         while (!fe_session_is_idle(p->session))
             mp_sleep_ns(MP_TIME_MS_TO_NS(2));
         fe_statistics statistics = {0};

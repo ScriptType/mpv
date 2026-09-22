@@ -25,12 +25,10 @@ class MacCommon: Common {
     var swapTime: UInt64 = 0
     let swapLock: NSCondition = NSCondition()
 
-    // AppKit callbacks invalidate renderer-owned colour state without making
-    // the VO thread synchronously dispatch to the main queue for every frame.
+    // Bumped by AppKit callbacks on the main thread, read by the VO thread.
     private let colorRevisionLock = NSLock()
     private var colorRevision: UInt64 = 0
 
-    // Opt-in observation only: never use force_render-adjusted visibility.
     private let visibilityDiagnostics = ProcessInfo.processInfo.environment["HDRPLAYER_MPV_VISIBILITY"] == "1"
     private var visibilityObservers: [NSObjectProtocol] = []
     private var visibilityTimer: Timer?
@@ -210,8 +208,6 @@ class MacCommon: Common {
         ]
         if let data = try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys]),
            let json = String(data: data, encoding: .utf8) {
-            // The explicit diagnostic flag enables these records independently
-            // of ordinary mpv log-level filtering. Each write is one full line.
             fputs("HDRPLAYER_MPV_WINDOW_STATE \(json)\n", stderr)
         }
         if visibilityRecords == visibilityRecordLimit {

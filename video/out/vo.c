@@ -173,7 +173,6 @@ struct vo_internal {
     int frame_refs;                 // max frames the VO may reference at once
     uint64_t current_frame_id;
 
-    // Optional native consumer snapshot. One selected frame, no export queue.
     bool hdr_export_enabled;
     struct mp_image *hdr_selected;
     uint64_t hdr_selected_id;
@@ -1565,8 +1564,7 @@ static void run_replace_current(void *argument)
     struct mp_image *image = args[1];
     bool *result = args[2];
     struct vo_internal *in = vo->in;
-    // gpu-next accepts the per-frame NV12/P010 and float hardware formats. A
-    // replacement must not discard a queued later frame or change geometry.
+    // Only gpu-next maps both the NV12/P010 and the float hardware formats.
     if (strcmp(vo->driver->name, "gpu-next")) return;
     mp_mutex_lock(&in->lock);
     struct mp_image *current = in->current_frame ? in->current_frame->current : NULL;
@@ -1575,8 +1573,6 @@ static void run_replace_current(void *argument)
     struct vo_frame *frame = matches ? vo_frame_ref(in->current_frame) : NULL;
     mp_mutex_unlock(&in->lock);
     if (!frame) return;
-    // Reconfigure colour interpretation on the renderer thread. The frame keeps
-    // its media timestamp; only the renderer cache identity changes.
     int status;
     void *config[] = {vo, image, &status};
     run_reconfig(config);

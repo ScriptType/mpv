@@ -1,4 +1,3 @@
-/* Included by client.c: optional native selected-frame client extension. */
 #include <libavutil/buffer.h>
 #include <libavutil/mathematics.h>
 #include "config.h"
@@ -58,9 +57,8 @@ static void hdr_lifetime_unref(struct hdr_lifetime *l)
 
 static void hdr_export_detach(mpv_handle *ctx)
 {
-    // Like client destruction itself, serialized with this client's API calls.
-    // Internal clients may be destroyed during initialization with core locked.
-    // They cannot own an exporter; do not acquire that lock recursively.
+    // Internal clients can be destroyed with the core already locked. They
+    // never own an exporter, so return before lock_core().
     if (!ctx->hdr_export) return;
     lock_core(ctx);
     struct mpv_hdr_export *e = ctx->clients->hdr_export;
@@ -258,7 +256,6 @@ mpv_hdr_status mpv_hdr_export_poll(mpv_hdr_export *e, uint64_t after_revision,
             s->pixel_format = CVPixelBufferGetPixelFormatType((CVPixelBufferRef)image->planes[3]);
     }
 
-    // The clock uses the same audio-delay interpretation as mpv video sync.
     if (mpctx->ao && !ao_untimed(mpctx->ao) && audio != MP_NOPTS_VALUE && isfinite(audio) &&
         isfinite(mpctx->audio_speed) && mpctx->audio_speed > 0 &&
         (ao_is_playing(mpctx->ao) || s->core_paused || s->buffering)) {
@@ -275,9 +272,6 @@ mpv_hdr_status mpv_hdr_export_poll(mpv_hdr_export *e, uint64_t after_revision,
     }
     s->reason = !image ? MPV_HDR_REASON_NO_VIDEO : MPV_HDR_REASON_NONE;
     if (image) {
-        // Both references are required: allocation of the selection token can
-        // fail independently of the image reference. av_buffer_ref requires a
-        // non-NULL source, and a lease without this token cannot track redraws.
         if (!selection || seeking || !mp_image_is_current(image) || (image->async_generation &&
             image->async_frame_generation != state->generation))
             s->reason = MPV_HDR_REASON_STALE;
@@ -302,8 +296,8 @@ mpv_hdr_status mpv_hdr_export_poll(mpv_hdr_export *e, uint64_t after_revision,
             s->reason = MPV_HDR_REASON_CLOCK;
     }
     s->supported = s->reason == MPV_HDR_REASON_NONE;
-    // Capability changes (e.g. a subtitle toggled while paused) invalidate
-    // already-exported leases even when the underlying frame did not change.
+    // A capability change (a subtitle toggled while paused, for example)
+    // invalidates existing leases even though the frame is unchanged.
     if (s->reason != e->observed_reason) {
         e->observed_reason = s->reason;
         atomic_fetch_add(&e->lifetime->epoch, 1);

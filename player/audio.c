@@ -230,8 +230,6 @@ static void ao_chain_reset_state(struct ao_chain *ao_c)
 
 static void invalidate_scheduled_audio_clock(struct MPContext *mpctx)
 {
-    // An audio-only restart must not revive a tuple from the previous clock
-    // domain before another video scheduling update. Preserve legacy avsync.
     mpctx->last_av_difference_valid = false;
     mpctx->last_av_difference_audio_pts = MP_NOPTS_VALUE;
     mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;

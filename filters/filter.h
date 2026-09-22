@@ -429,9 +429,9 @@ struct mp_stream_info {
     bool force_swdec;
     struct vo *dr_vo; // for calling vo_get_image()
     struct mp_async_video_state *async_video;
-    const char *source_path; // supplied by the opened playback core, not options
-    const char *source_demuxer; // actual demuxer class, including native Matroska
-    double source_timestamp_offset; // opened core's applied source timeline offset
+    const char *source_path;
+    const char *source_demuxer;
+    double source_timestamp_offset;
     int video_ordinal; // index among this demuxer's video streams; -1 if unknown
     int dovi_profile, dovi_level, dovi_compatibility_id;
 };

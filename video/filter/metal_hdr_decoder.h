@@ -8,7 +8,6 @@
 struct mp_filter;
 struct mp_image;
 
-// Same source interpretation/timing for live frames and independent preparation.
 bool mp_hdr_frame_descriptor(struct mp_image *image, fe_frame *frame,
                             double reference_white, double hlg_peak,
                             char *error, size_t capacity);

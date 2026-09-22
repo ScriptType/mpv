@@ -1,5 +1,4 @@
 /*
- * Independent source-core demux + FFmpeg VideoToolbox Prepared decoder.
  * This file is part of mpv, licensed under LGPL 2.1 or later.
  */
 #import <CoreVideo/CoreVideo.h>
@@ -92,7 +91,7 @@ static enum AVPixelFormat videotoolbox_format(AVCodecContext *codec,
         if (formats[n] == AV_PIX_FMT_VIDEOTOOLBOX)
             return formats[n];
     }
-    return AV_PIX_FMT_NONE; // never silently switch the Prepared pixel contract
+    return AV_PIX_FMT_NONE;
 }
 
 static void *open_reader(void *opaque, const char *path, uint32_t ordinal,
@@ -111,9 +110,8 @@ static void *open_reader(void *opaque, const char *path, uint32_t ordinal,
     reader->owner = owner;
     reader->start = start; reader->end = end; reader->mode = mode;
     reader->cancel = mp_cancel_new(NULL);
-    // A separate synchronous demuxer preserves native Matroska BlockDuration,
-    // packet side data and missing-duration semantics. Reopening with libavformat
-    // would synthesize rounded durations that differ from the actual core.
+    // Reopening with libavformat would synthesize rounded durations. mpv's own
+    // demuxer keeps Matroska BlockDuration, side data and missing durations.
     struct demuxer_params params = {
         .force_format = owner->demuxer,
         .stream_flags = STREAM_READ_FILE_FLAGS_DEFAULT,
@@ -178,8 +176,6 @@ fail:
 static void merge_container_params(struct mp_image *image, const struct mp_codec_params *source)
 {
     struct mp_image_params *params = &image->params;
-    // Match default decoder-wrapper interpretation. Transforms remain unbaked
-    // metadata; the cache stores the coded frame's linear pixels.
     if (source->par_w > 0 && source->par_h > 0) {
         params->p_w = source->par_w; params->p_h = source->par_h;
     }
@@ -255,8 +251,8 @@ static fe_status next_frame(void *opaque, fe_frame *result, char *error, size_t 
             }
             reader->draining = read_status < 0;
         }
-        // mp_set_av_packet borrows the demux packet's data/side-data. libavcodec
-        // retains accepted data internally. Do not unref this borrowed wrapper.
+        // mp_set_av_packet borrows the demux packet's data and side data, and
+        // libavcodec references what it keeps. Never unref this wrapper.
         AVPacket packet = {0};
         mp_set_av_packet(&packet, reader->packet, &reader->timebase);
         status = avcodec_send_packet(reader->codec, reader->packet ? &packet : NULL);

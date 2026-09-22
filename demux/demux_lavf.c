@@ -1623,9 +1623,8 @@ static int demux_open_lavf(demuxer_t *demuxer, enum demux_check check)
     double duration = av_duration > 0 ? av_duration : total_duration;
     if (duration <= 0 && priv->avfc->duration > 0)
         duration = (double)priv->avfc->duration / AV_TIME_BASE;
-    // Whitelisted formats may skip find_stream_info(), leaving the aggregate
-    // origin unknown despite complete stream headers. Preserve any supplied
-    // aggregate origin and longer duration; use only proven primary A/V bounds.
+    // Formats that skip find_stream_info() leave avfc->start_time unset even
+    // with complete stream headers.
     struct mp_lavf_timing timing = mp_lavf_resolve_timing(avfc, duration);
     if (timing.start_time != AV_NOPTS_VALUE)
         demuxer->start_time = timing.start_time / (double)AV_TIME_BASE;
