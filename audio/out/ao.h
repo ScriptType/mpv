@@ -104,6 +104,13 @@ enum ao_media_gate_mode {
     AO_MEDIA_DISABLED, AO_MEDIA_CLOSED, AO_MEDIA_CREDIT, AO_MEDIA_TERMINAL,
 };
 
+struct ao_callback_time {
+    bool host_valid, bounds_valid;
+    uint32_t source_flags;
+    uint64_t host_ticks;
+    int64_t host_ns, start_ns, end_ns;
+};
+
 struct ao_media_gate_snapshot {
     enum ao_media_gate_mode mode;
     struct mp_media_timeline timeline;
@@ -116,6 +123,9 @@ struct ao_media_gate_snapshot {
     const char *last_invalid_reason;
     double invalid_media_start, invalid_wall_start, prior_media_end, prior_wall_end;
     int invalid_callback_samples, invalid_copy_offset;
+    struct ao_callback_time callback_time, invalid_callback_time;
+    int64_t last_admitted_callback_end_ns;
+    int64_t invalid_prior_callback_end_ns, invalid_callback_delta_ns;
 };
 
 // begin runs before ao_start; control and snapshot serialize with actual copies.
@@ -126,6 +136,8 @@ bool ao_media_gate_control(struct ao *ao, uint64_t epoch,
                            enum ao_media_gate_mode mode, double ceiling,
                            double played_wall, double released_media);
 void ao_media_gate_snapshot(struct ao *ao, struct ao_media_gate_snapshot *snapshot);
+int ao_read_data_with_timing(struct ao *ao, void **data, int samples,
+                             const struct ao_callback_time *timing);
 
 void ao_reset(struct ao *ao);
 void ao_start(struct ao *ao);

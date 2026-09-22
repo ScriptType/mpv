@@ -173,7 +173,8 @@ void ao_media_gate_snapshot(struct ao *ao, struct ao_media_gate_snapshot *snapsh
 
 // Special behavior with data==NULL: caller uses p->pending.
 static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
-                       bool pad_silence, int64_t out_time_ns, bool *held)
+                       bool pad_silence, const struct ao_callback_time *timing,
+                       bool *held)
 {
     struct buffer_state *p = ao->buffer_state;
     int pos = 0;
@@ -224,8 +225,7 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
                 .effective_rate = mp_aframe_get_effective_rate(p->pending),
                 .output_rate = ao->samplerate,
                 .media_start = mp_aframe_get_pts(p->pending),
-                .wall_start = pos ? wall_cursor : MP_TIME_NS_TO_S(out_time_ns) -
-                              samples / (double)ao->samplerate,
+                .wall_start = pos ? wall_cursor : MP_TIME_NS_TO_S(timing->start_ns),
             };
             double ceiling = p->media.mode == AO_MEDIA_TERMINAL ?
                 DBL_MAX : p->media.ceiling;
@@ -233,7 +233,7 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
             if (source.media_start != MP_NOPTS_VALUE) {
                 admission = mp_media_gate_admit(&p->media.timeline,
                     p->media.timeline.epoch, source, ceiling,
-                    MP_TIME_NS_TO_S(out_time_ns), samples, pos, &wall_cursor);
+                    timing->start_ns, timing->end_ns, samples, pos, &wall_cursor);
             }
             if (admission.status != MP_MEDIA_ADMITTED) {
                 *held = true;
@@ -259,6 +259,11 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
                     p->media.prior_wall_end = wall_end;
                     p->media.invalid_callback_samples = samples;
                     p->media.invalid_copy_offset = pos;
+                    p->media.invalid_callback_time = *timing;
+                    p->media.invalid_prior_callback_end_ns = pos ? timing->end_ns :
+                        p->media.last_admitted_callback_end_ns;
+                    p->media.invalid_callback_delta_ns = timing->start_ns -
+                        p->media.invalid_prior_callback_end_ns;
                 }
                 p->media.full_refusals += admission.status == MP_MEDIA_FULL;
                 break;
@@ -301,18 +306,40 @@ static int read_buffer(struct ao *ao, void **data, int samples, bool *eof,
 }
 
 static int ao_read_data_locked(struct ao *ao, void **data, int samples,
-                               int64_t out_time_ns, bool *eof, bool pad_silence)
+                               int64_t out_time_ns, bool *eof, bool pad_silence,
+                               const struct ao_callback_time *timing)
 {
     struct buffer_state *p = ao->buffer_state;
     mp_assert(!ao->driver->write);
 
     bool held = false;
     bool gated = p->media.mode != AO_MEDIA_DISABLED;
-    if (gated) {
-        p->media.slot_end = MP_TIME_NS_TO_S(out_time_ns);
-        p->media.slot_start = p->media.slot_end - samples / (double)ao->samplerate;
+    if (timing)
+        p->media.callback_time = *timing;
+    if ((gated || timing) && (!timing || !timing->host_valid ||
+        !timing->bounds_valid || timing->start_ns < 0 || timing->end_ns <= timing->start_ns)) {
+        p->media.invalid_copies++;
+        p->media.silent_callbacks++;
+        p->media.last_invalid_reason = !timing ? "missing-callback-time" :
+            !timing->host_valid ? "missing-host-time" : "invalid-callback-time";
+        p->media.invalid_callback_time = timing ? *timing : (struct ao_callback_time){0};
+        p->media.invalid_callback_samples = samples;
+        p->media.invalid_copy_offset = 0;
+        if (pad_silence) {
+            for (int n = 0; n < ao->num_planes; n++)
+                af_fill_silence(data[n], samples * ao->sstride, ao->format);
+        }
+        *eof = false;
+        ao->wakeup_cb(ao->wakeup_ctx);
+        return 0;
     }
-    int pos = read_buffer(ao, data, samples, eof, pad_silence, out_time_ns, &held);
+    if (gated) {
+        p->media.slot_end = MP_TIME_NS_TO_S(timing->end_ns);
+        p->media.slot_start = MP_TIME_NS_TO_S(timing->start_ns);
+    }
+    int pos = read_buffer(ao, data, samples, eof, pad_silence, timing, &held);
+    if (gated && pos > 0)
+        p->media.last_admitted_callback_end_ns = timing->end_ns;
     if (gated) {
         p->media.silent_callbacks += pos == 0;
         p->media.source_starvation_callbacks += pos < samples && !held &&
@@ -358,11 +385,22 @@ int ao_read_data(struct ao *ao, void **data, int samples, int64_t out_time_ns, b
         eof = &eof_buf;
     }
 
-    int pos = ao_read_data_locked(ao, data, samples, out_time_ns, eof, pad_silence);
+    int pos = ao_read_data_locked(ao, data, samples, out_time_ns, eof, pad_silence, NULL);
 
     mp_mutex_unlock(&p->lock);
 
     return pos;
+}
+
+int ao_read_data_with_timing(struct ao *ao, void **data, int samples,
+                             const struct ao_callback_time *timing)
+{
+    struct buffer_state *p = ao->buffer_state;
+    bool eof;
+    mp_mutex_lock(&p->lock);
+    int copied = ao_read_data_locked(ao, data, samples, timing->end_ns, &eof, true, timing);
+    mp_mutex_unlock(&p->lock);
+    return copied;
 }
 
 // Same as ao_read_data(), but convert data according to *fmt.
@@ -803,7 +841,7 @@ static bool ao_play_data(struct ao *ao)
     bool got_eof = false;
     if (ao->driver->write_frames) {
         TA_FREEP(&p->pending);
-        samples = read_buffer(ao, NULL, 1, &got_eof, false, 0, NULL);
+        samples = read_buffer(ao, NULL, 1, &got_eof, false, NULL, NULL);
         planes = (void **)&p->pending;
     } else {
         if (!realloc_buf(ao, space)) {
@@ -820,7 +858,7 @@ static bool ao_play_data(struct ao *ao)
         }
 
         if (!samples) {
-            samples = read_buffer(ao, planes, space, &got_eof, true, 0, NULL);
+            samples = read_buffer(ao, planes, space, &got_eof, true, NULL, NULL);
             if (p->paused || (ao->stream_silence && !p->playing))
                 samples = space; // read_buffer() sets remainder to silent
         }

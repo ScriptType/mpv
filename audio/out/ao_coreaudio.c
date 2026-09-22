@@ -16,6 +16,9 @@
  */
 
 #include <CoreAudio/HostTime.h>
+#include <stdlib.h>
+#include <string.h>
+#include <limits.h>
 #include <libavutil/mathematics.h>
 
 #include "ao.h"
@@ -42,6 +45,7 @@ struct priv {
     AudioUnit audio_unit;
 
     uint64_t hw_latency_ns;
+    bool media_gate_timestamps;
 
     AudioStreamBasicDescription original_asbd;
     AudioStreamID original_asbd_stream;
@@ -91,6 +95,28 @@ static OSStatus render_cb_lpcm(void *ctx, AudioUnitRenderActionFlags *aflags,
 
     for (int n = 0; n < ao->num_planes; n++)
         planes[n] = buffer_list->mBuffers[n].mData;
+
+    if (p->media_gate_timestamps) {
+        struct ao_callback_time timing = {
+            .host_valid = ts->mFlags & kAudioTimeStampHostTimeValid,
+            .source_flags = ts->mFlags,
+            .host_ticks = ts->mHostTime,
+        };
+        if (timing.host_valid) {
+            timing.host_ns = mp_time_ns_from_raw_time(mp_raw_time_ns_from_mach(ts->mHostTime));
+            int64_t duration = ca_frames_to_ns(ao, frames);
+            if (timing.host_ns >= 0 && p->hw_latency_ns <= INT64_MAX &&
+                timing.host_ns <= INT64_MAX - (int64_t)p->hw_latency_ns && duration > 0) {
+                timing.start_ns = timing.host_ns + (int64_t)p->hw_latency_ns;
+                if (timing.start_ns <= INT64_MAX - duration) {
+                    timing.end_ns = timing.start_ns + duration;
+                    timing.bounds_valid = true;
+                }
+            }
+        }
+        ao_read_data_with_timing(ao, planes, frames, &timing);
+        return noErr;
+    }
 
     int64_t end = mp_time_ns();
     end += p->hw_latency_ns + ca_get_latency(ts) + ca_frames_to_ns(ao, frames);
@@ -158,6 +184,8 @@ coreaudio_error:
 static int init(struct ao *ao)
 {
     struct priv *p = ao->priv;
+    const char *gate = getenv("HDRPLAYER_ADAPTIVE_MEDIA_GATE");
+    p->media_gate_timestamps = gate && !strcmp(gate, "1");
 
     if (!af_fmt_is_pcm(ao->format) || (ao->init_flags & AO_INIT_EXCLUSIVE)) {
         MP_VERBOSE(ao, "redirecting to coreaudio_exclusive\n");

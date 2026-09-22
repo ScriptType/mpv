@@ -6,16 +6,16 @@
 // Copy offsets belong to the full callback, including its unconsumed silence.
 static inline struct mp_media_admission mp_media_gate_admit(
     struct mp_media_timeline *timeline, uint64_t epoch, struct mp_media_copy copy,
-    double ceiling, double callback_end, int callback_samples, int offset,
-    double *wall_cursor)
+    double ceiling, int64_t callback_start_ns, int64_t callback_end_ns,
+    int callback_samples, int offset, double *wall_cursor)
 {
-    if (!isfinite(callback_end) || callback_samples <= 0 || offset < 0 ||
+    if (callback_start_ns >= callback_end_ns || callback_samples <= 0 || offset < 0 ||
         offset >= callback_samples || copy.available > callback_samples - offset)
         return (struct mp_media_admission){.status = MP_MEDIA_INVALID};
     // The cursor belongs to this callback and advances only after reservation.
     // A new callback always derives its own slot start and retains overlap checks.
-    copy.wall_start = offset ? *wall_cursor :
-        callback_end - callback_samples / copy.output_rate;
+    double callback_end = callback_end_ns / 1e9;
+    copy.wall_start = offset ? *wall_cursor : callback_start_ns / 1e9;
     if (!isfinite(copy.wall_start) || callback_end <= copy.wall_start)
         return (struct mp_media_admission){.status = MP_MEDIA_INVALID};
     bool has_previous = timeline->count || timeline->has_retired;
