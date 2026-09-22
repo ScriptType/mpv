@@ -1720,16 +1720,16 @@ static int mp_property_enhancement_state(void *ctx, struct m_property *prop,
     node_map_add_string(r, "video-status", mp_status_str(mpctx->video_status));
     bool audio_clock_active = audio_is_clock_active(mpctx);
     double audio_pts = audio_clock_active ? playing_audio_pts(mpctx) : MP_NOPTS_VALUE;
+    bool audio_pts_valid = audio_pts != MP_NOPTS_VALUE && isfinite(audio_pts);
     node_map_add_flag(r, "audio-clock-active", audio_clock_active);
-    if (audio_pts != MP_NOPTS_VALUE && isfinite(audio_pts))
+    if (audio_pts_valid)
         node_map_add_double(r, "audio-pts-seconds", audio_pts);
     else
         node_map_add(r, "audio-pts-seconds", MPV_FORMAT_NONE);
     // AO exhaustion can happen without another video scheduling update. Mask
     // the cached tuple once its current clock domain is no longer active.
-    bool scheduled_valid = mpctx->last_av_difference_valid && audio_clock_active &&
-        mpctx->video_status == STATUS_PLAYING && audio_pts != MP_NOPTS_VALUE &&
-        isfinite(audio_pts);
+    bool scheduled_valid = mpctx->last_av_difference_valid && audio_pts_valid &&
+        mpctx->video_status == STATUS_PLAYING;
     node_map_add_flag(r, "scheduled-avsync-valid", scheduled_valid);
     if (scheduled_valid) {
         node_map_add_double(r, "scheduled-avsync-seconds", mpctx->last_av_difference);

@@ -185,7 +185,7 @@ class MacCommon: Common {
     }
 
     private func recordVisibility(_ event: String) {
-        guard visibilityDiagnostics, visibilityRecords < visibilityRecordLimit else { return }
+        guard visibilityRecords < visibilityRecordLimit else { return }
         visibilityRecords += 1
         let current = presentationWindow
         let content = view.map { $0.convertToBacking($0.bounds).size } ?? .zero

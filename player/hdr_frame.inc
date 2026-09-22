@@ -157,12 +157,12 @@ static bool hdr_same_owner(AVBufferRef *a, AVBufferRef *b)
     return (!a && !b) || (a && b && a->data == b->data);
 }
 
-static bool hdr_source_time(struct mp_image *image, mpv_hdr_time *time)
+static void hdr_source_time(struct mp_image *image, mpv_hdr_time *time)
 {
-    return image->source_pts != AV_NOPTS_VALUE && image->source_timebase_num > 0 &&
+    if (image->source_pts != AV_NOPTS_VALUE && image->source_timebase_num > 0 &&
         image->source_timebase_den > 0 &&
-        !__builtin_mul_overflow(image->source_pts, (int64_t)image->source_timebase_num, &time->value) &&
-        (time->timescale = image->source_timebase_den) > 0;
+        !__builtin_mul_overflow(image->source_pts, (int64_t)image->source_timebase_num, &time->value))
+        time->timescale = image->source_timebase_den;
 }
 
 static bool hdr_geometry_supported(struct mp_image *i)

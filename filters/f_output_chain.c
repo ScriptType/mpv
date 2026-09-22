@@ -408,9 +408,9 @@ void mp_output_chain_set_source(struct mp_output_chain *c, const char *path,
 {
     struct chain *p = c->f->priv;
     talloc_free((void *)p->stream_info.source_path);
-    p->stream_info.source_path = path ? talloc_strdup(p, path) : NULL;
+    p->stream_info.source_path = talloc_strdup(p, path);
     talloc_free((void *)p->stream_info.source_demuxer);
-    p->stream_info.source_demuxer = demuxer ? talloc_strdup(p, demuxer) : NULL;
+    p->stream_info.source_demuxer = talloc_strdup(p, demuxer);
     p->stream_info.source_timestamp_offset = timestamp_offset;
     p->stream_info.video_ordinal = video_ordinal;
 }

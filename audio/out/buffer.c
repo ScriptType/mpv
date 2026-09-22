@@ -296,8 +296,7 @@ double ao_get_pause_clock_tail(struct ao *ao)
 {
     // Other AOs can preserve queued samples on pause. Their device delay is
     // not a draining clock tail, and must not make Adaptive pause early.
-    if (!ao->driver->has_pause_clock_tail || ao->driver->write ||
-        ao->driver->set_pause || !ao->driver->reset || ao->stream_silence)
+    if (!ao->driver->has_pause_clock_tail || ao->stream_silence)
         return -1;
     struct buffer_state *p = ao->buffer_state;
     mp_mutex_lock(&p->lock);

@@ -102,7 +102,6 @@ static bool mac_vk_set_color(struct ra_ctx *ctx, struct mp_image_params *params)
         // branch, like its linear branch, does not clear that metadata.
         if (p->linear_hdr_active || !params || !pl_color_space_is_hdr(&params->color))
             mac_vk_clear_linear_metadata(p);
-        p->linear_hdr_active = false;
         return false;
     }
 

@@ -124,11 +124,10 @@ static void refresh_prepared(struct priv *p)
 
 static void update_state(struct priv *p)
 {
-    p->opts->policy = p->live_policy.mode == MP_HDR_ADAPTIVE;
     if (!p->state || p->state->owner != p)
         return;
     p->state->active = !p->opts->bypass && !p->dovi_detected;
-    p->state->adaptive = p->opts->policy == 1 && p->state->active;
+    p->state->adaptive = p->live_policy.mode == MP_HDR_ADAPTIVE && p->state->active;
     p->state->live = p->live_policy.mode == MP_HDR_LIVE;
     p->state->live_qualified = p->live_policy.qualified;
     p->state->warmed_samples = p->live_policy.warmed_samples;
