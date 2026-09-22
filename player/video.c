@@ -105,13 +105,24 @@ static void clear_av_diff(struct MPContext *mpctx)
     mpctx->last_av_difference_video_pts = MP_NOPTS_VALUE;
 }
 
+// Hold or release both playback clocks while an enhanced frame is pending.
+static void set_enhancement_pause(struct MPContext *mpctx, bool paused)
+{
+    if (mpctx->paused_for_enhancement == paused)
+        return;
+    if (paused) {
+        mpctx->enhancement_buffer_start = mp_time_sec();
+        mpctx->enhancement_buffer_count++;
+    } else {
+        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
+    }
+    mpctx->paused_for_enhancement = paused;
+    update_internal_pause_state(mpctx);
+}
+
 void reset_video_state(struct MPContext *mpctx)
 {
-    if (mpctx->paused_for_enhancement) {
-        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
-        mpctx->paused_for_enhancement = false;
-        update_internal_pause_state(mpctx);
-    }
+    set_enhancement_pause(mpctx, false);
     if (mpctx->vo_chain) {
         vo_chain_reset_state(mpctx->vo_chain);
         struct track *t = mpctx->vo_chain->track;
@@ -1131,19 +1142,10 @@ void write_video(struct MPContext *mpctx)
     bool preview_wait = async->active && async->waiting_preview && vo_has_frame(vo);
     bool keep_buffering = preview_wait ||
         (async->adaptive && mpctx->paused_for_enhancement);
-    if ((!async->active || !keep_buffering) && mpctx->paused_for_enhancement) {
-        mpctx->paused_for_enhancement = false;
-        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
-        update_internal_pause_state(mpctx);
-        mp_client_property_change(mpctx, "enhancement-state");
-    }
-    if (preview_wait && !mpctx->paused_for_enhancement) {
-        mpctx->paused_for_enhancement = true;
-        mpctx->enhancement_buffer_start = mp_time_sec();
-        mpctx->enhancement_buffer_count++;
-        update_internal_pause_state(mpctx);
-        mp_client_property_change(mpctx, "enhancement-state");
-    }
+    if (!async->active || !keep_buffering)
+        set_enhancement_pause(mpctx, false);
+    if (preview_wait)
+        set_enhancement_pause(mpctx, true);
 
     if (vo_c->filter->reconfig_happened) {
         mp_notify(mpctx, MPV_EVENT_VIDEO_RECONFIG, NULL);
@@ -1177,22 +1179,17 @@ void write_video(struct MPContext *mpctx)
             bool wait_for_video = vo_still_displaying(vo);
             if (async->adaptive && wait_for_video && mpctx->ao && audio_is_clock_active(mpctx) &&
                 !mpctx->display_sync_active && !ao_untimed(mpctx->ao)) {
-                // The measured CoreAudio pull clock can keep advancing after a
-                // reset-based pause. Account for that tail before the current
-                // video deadline. Unqualified AOs retain the ordinary deadline.
-                // Use the core timer as well as the potentially late VO wakeup.
+                // The CoreAudio pull clock keeps advancing after a reset-based
+                // pause, so pause that tail ahead of the video deadline. AOs
+                // without a known tail keep the ordinary VO deadline.
                 int64_t frame_end = vo_get_last_frame_end(vo);
                 double tail = ao_get_pause_clock_tail(mpctx->ao);
-                if (frame_end > 0 && isfinite(tail) && tail >= 0) {
-                    double lead = tail + .002;
-                    double remaining = MP_TIME_NS_TO_S(frame_end - mp_time_ns()) - lead;
-                    // An unavailable estimate retains the ordinary VO deadline.
-                    if (isfinite(remaining)) {
-                        if (remaining > 0)
-                            mp_set_timeout(mpctx, remaining);
-                        else
-                            wait_for_video = false;
-                    }
+                if (frame_end > 0 && tail >= 0) {
+                    double remaining = MP_TIME_NS_TO_S(frame_end - mp_time_ns()) - (tail + .002);
+                    if (remaining > 0)
+                        mp_set_timeout(mpctx, remaining);
+                    else
+                        wait_for_video = false;
                 }
             }
             if (wait_for_video) {
@@ -1204,12 +1201,8 @@ void write_video(struct MPContext *mpctx)
                     mp_output_chain_command(vo_c->filter, "all", &command);
                     MP_WARN(mpctx, "Live missed a video deadline; using Adaptive shared-clock buffering\n");
                 }
-                mpctx->paused_for_enhancement = true;
-                mpctx->enhancement_buffer_start = mp_time_sec();
-                mpctx->enhancement_buffer_count++;
                 double audio_before_pause = playing_audio_pts(mpctx);
-                update_internal_pause_state(mpctx);
-                mp_client_property_change(mpctx, "enhancement-state");
+                set_enhancement_pause(mpctx, true);
                 MP_VERBOSE(mpctx, "Adaptive enhancement buffer: both playback clocks paused; "
                     "video=%.9f audio-before=%.9f audio-after=%.9f transition=%.9f\n",
                     mpctx->video_pts, audio_before_pause, playing_audio_pts(mpctx),
@@ -1228,11 +1221,7 @@ void write_video(struct MPContext *mpctx)
     }
 
     if (r == VD_EOF) {
-        if (mpctx->paused_for_enhancement) {
-            mpctx->paused_for_enhancement = false;
-            mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
-            update_internal_pause_state(mpctx);
-        }
+        set_enhancement_pause(mpctx, false);
         if (check_for_hwdec_fallback(mpctx))
             return;
         if (check_for_forced_eof(mpctx)) {
@@ -1373,10 +1362,7 @@ void write_video(struct MPContext *mpctx)
             return;
         double resume_start = mp_time_sec();
         double audio_before_resume = playing_audio_pts(mpctx);
-        mpctx->paused_for_enhancement = false;
-        mpctx->enhancement_buffer_seconds += mp_time_sec() - mpctx->enhancement_buffer_start;
-        update_internal_pause_state(mpctx);
-        mp_client_property_change(mpctx, "enhancement-state");
+        set_enhancement_pause(mpctx, false);
         MP_VERBOSE(mpctx, "Adaptive enhancement ready: video=%.9f next=%.9f "
             "audio-before=%.9f audio-after=%.9f transition=%.9f\n",
             mpctx->video_pts, mpctx->next_frames[0]->pts,
@@ -1451,13 +1437,6 @@ void write_video(struct MPContext *mpctx)
     shift_frames(mpctx);
 
     schedule_frame(mpctx, frame);
-
-    if (async->active && fabs(mpctx->last_av_difference) > .020) {
-        MP_VERBOSE(mpctx, "Enhancement clock offset: video=%.9f audio=%.9f "
-            "avsync=%.9f time-frame=%.9f frame-duration=%.9f\n",
-            mpctx->video_pts, playing_audio_pts(mpctx), mpctx->last_av_difference,
-            mpctx->time_frame, MP_TIME_NS_TO_S(frame->duration));
-    }
 
     mpctx->osd_force_update = true;
     update_osd_msg(mpctx);
