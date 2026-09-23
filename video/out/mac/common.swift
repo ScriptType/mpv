@@ -232,6 +232,11 @@ class Common: NSObject {
                 self.flagEvents(VO_EVENT_RESIZE | VO_EVENT_EXPOSE | VO_EVENT_WIN_STATE | VO_EVENT_FOCUS)
             })
         }
+        // A display preset or arrangement change can alter EDR headroom without any window notification.
+        embeddedObservers.append(center.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+                                                    object: nil, queue: .main) { [weak self] _ in
+            self?.windowDidChangeScreenProfile()
+        })
         updateDisplaylink()
     }
 
