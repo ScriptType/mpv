@@ -823,8 +823,15 @@ static void process(struct mp_filter *f)
         return;
     }
     fe_status status = fe_session_submit(p->session, &frame);
-    if (status == FE_FULL)
+    if (status == FE_FULL) {
+        // A slot or memory reservation frees without waking this filter, so
+        // poll admission until a submission is accepted.
+        mp_mutex_lock(&p->lock);
+        p->retry_admission = true;
+        mp_cond_signal(&p->wakeup);
+        mp_mutex_unlock(&p->lock);
         return;
+    }
     if (status != FE_ACCEPTED) {
         MP_ERR(f, "HDR submission rejected with status %d\n", status);
         mp_filter_internal_mark_failed(f);
