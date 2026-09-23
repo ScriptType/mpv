@@ -806,7 +806,8 @@ static void process(struct mp_filter *f)
     image->async_generation = av_buffer_ref(p->generation);
     image->async_frame_generation = frame.generation;
     image->async_content_kind = FE_CONTENT_ORIGINAL;
-    if (p->need_preview && p->state && !p->preview_emitted) {
+    // Direct playback never pauses the clocks, so it has no original-first preview to wait for.
+    if (p->need_preview && p->state && !p->preview_emitted && p->live_policy.mode != MP_HDR_DIRECT) {
         struct mp_image *preview = mp_image_new_ref(image);
         preview->async_original = true;
         preview->async_preview = true;
